@@ -12,6 +12,7 @@ class DatasetCustom(Dataset):
     def __init__(self, datapath, fold, transform, split, shot, img_size, use_original_imgsize, seed=None):
         self.split = split
         self.shot = shot
+        self.benchmark = 'custom'
         self.base_path = datapath
         self.transform = transform
         self.img_size = img_size
@@ -25,6 +26,7 @@ class DatasetCustom(Dataset):
         ])
         if not self.all_classes:
             raise RuntimeError(f'No class directories found in {self.base_path}')
+        self.nclass = len(self.all_classes)
 
         n_train = max(1, int(len(self.all_classes) * 0.8))
         if split == 'trn':

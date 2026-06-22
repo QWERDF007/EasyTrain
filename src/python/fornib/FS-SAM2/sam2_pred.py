@@ -46,12 +46,14 @@ def iou_loss(
 
 
 class SAM2_pred(nn.Module):
-    def __init__(self, benchmark=None):
+    def __init__(self, checkpoint=None, model_cfg=None):
         super().__init__()
         from sam2.build_sam import build_sam2  # defer import for CLI help
 
-        checkpoint = "./checkpoint/sam2.1_hiera_base_plus.pt"
-        model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        if checkpoint is None:
+            checkpoint = "./checkpoint/sam2.1_hiera_base_plus.pt"
+        if model_cfg is None:
+            model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
         self.model = build_sam2(model_cfg, checkpoint)
 
         # loss functions

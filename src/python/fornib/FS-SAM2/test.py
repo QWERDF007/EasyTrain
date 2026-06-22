@@ -85,6 +85,8 @@ def main():
     parser.add_argument('--nworker', type=int, default=8, help='number of cpu threads to use during batch generation')  # 0 for Windows, 8 for Linux
     parser.add_argument('--use_ignore', type=bool, default=True, help='Boundaries are not considered during PASCAL training')
     parser.add_argument('--visualize', default=True, action='store_true')
+    parser.add_argument('--sam2_checkpoint', type=str, default='./checkpoint/sam2.1_hiera_base_plus.pt')
+    parser.add_argument('--sam2_cfg', type=str, default='configs/sam2.1/sam2.1_hiera_b+.yaml')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
     
@@ -124,7 +126,7 @@ def main():
     from sam2_pred import SAM2_pred
     # from sam2.sam2_video_predictor import SAM2VideoPredictorVOS
 
-    sam_model = SAM2_pred()
+    sam_model = SAM2_pred(checkpoint=args.sam2_checkpoint, model_cfg=args.sam2_cfg)
     # sam_model.model.image_encoder.forward = torch.compile(  # compile image encoder (only works without LoRA)
     #             sam_model.model.image_encoder.forward,
     #             mode="max-autotune",
