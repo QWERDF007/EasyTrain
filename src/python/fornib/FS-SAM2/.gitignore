@@ -1,0 +1,13 @@
+checkpoint/
+logs/
+vis/
+
+
+# Others
+.vscode/
+.DS_Store
+__pycache__/
+*-checkpoint.ipynb
+.venv
+*.egg*
+_C.*
