@@ -81,12 +81,13 @@ class DatasetCustom(Dataset):
         # sample k support images from the same class
         support_txt = os.path.join(self.base_path, query_class, 'support.txt')
         with open(support_txt, 'r') as f:
-            support_names = [line.strip() for line in f if line.strip()]
-        support_names = rng.choice(support_names, self.shot, replace=False).tolist()
-        support_imgs = [Image.open(self._find_image(query_class, name)).convert('RGB') for name in support_names]
-        support_masks = [self.read_mask(os.path.join(self.base_path, query_class, 'masks', name + '.png')) for name in support_names]
+            support_entries = [line.strip().split(',', 1) for line in f if line.strip()]
+        chosen = rng.choice(support_entries, self.shot, replace=False).tolist()
+        chosen_names = [e[1] for e in chosen]
+        support_imgs = [Image.open(self._find_image(query_class, name)).convert('RGB') for name in chosen_names]
+        support_masks = [self.read_mask(os.path.join(self.base_path, query_class, 'masks', name + '.png')) for name in chosen_names]
 
-        return query_name, query_img, query_mask, support_names, support_imgs, support_masks, class_sample
+        return query_name, query_img, query_mask, chosen_names, support_imgs, support_masks, class_sample
 
     def _find_image(self, class_dir, name):
         for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
@@ -107,7 +108,10 @@ class DatasetCustom(Dataset):
             query_txt = os.path.join(self.base_path, cls, 'query.txt')
             with open(query_txt, 'r') as f:
                 for line in f:
-                    name = line.strip()
-                    if name:
-                        img_metadata.append((name, cls))
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(',', 1)
+                    name = parts[1] if len(parts) > 1 else parts[0]  # compat: plain name or id,name
+                    img_metadata.append((name, cls))
         return img_metadata

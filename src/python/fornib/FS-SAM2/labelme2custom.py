@@ -123,22 +123,23 @@ def main():
         os.makedirs(os.path.join(cls_dir, 'images'), exist_ok=True)
         os.makedirs(os.path.join(cls_dir, 'masks'), exist_ok=True)
 
-        def write_items(item_list, lst_file):
+        def write_items(item_list, lst_file, start_id=0):
             names = []
-            for img_path, mask in item_list:
+            for i, (img_path, mask) in enumerate(item_list):
                 stem = Path(img_path).stem
                 ext = Path(img_path).suffix
-                # Dedup: include original filename stem as prefix
                 safe_name = sanitize(stem)
                 dst_img = os.path.join(cls_dir, 'images', safe_name + ext)
-                # Only copy if not already there (same image may have multiple labels)
                 if not os.path.exists(dst_img):
                     Image.open(img_path).save(dst_img)
                 mask.save(os.path.join(cls_dir, 'masks', safe_name + '.png'))
-                names.append(safe_name)
+                names.append(f'{start_id + i},{safe_name}')
             with open(os.path.join(cls_dir, lst_file), 'w') as f:
                 f.write('\n'.join(names) + '\n')
             return names
+
+        sn = write_items(support_items, 'support.txt', start_id=0)
+        qn = write_items(query_items, 'query.txt', start_id=len(support_items))
 
         sn = write_items(support_items, 'support.txt')
         qn = write_items(query_items, 'query.txt')
