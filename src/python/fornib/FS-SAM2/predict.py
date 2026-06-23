@@ -133,12 +133,29 @@ def main():
             current_out = model(support_imgs[i].unsqueeze(0), support_masks[i].unsqueeze(0), prev_out=current_out)
     print('Support encoding done.')
 
-    # Predict each query image
-    query_paths = load_queries(args.query_dir)
-    print(f'Found {len(query_paths)} query images')
-    for qpath in query_paths:
-        name = Path(qpath).stem
-        print(f'  Processing: {name}')
+    # Build query list — use query.txt if present, else all images in dir
+    query_txt = os.path.join(args.query_dir, 'query.txt')
+    if os.path.exists(query_txt):
+        query_list = []
+        with open(query_txt, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                qid, qname = line.split(',', 1)
+                for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
+                    p = os.path.join(args.query_dir, qname + ext)
+                    if os.path.exists(p):
+                        query_list.append((qid, p))
+                        break
+                else:
+                    print(f'  Skip (no image): {qname}')
+    else:
+        query_list = [(Path(p).stem, p) for p in load_queries(args.query_dir)]
+
+    print(f'Found {len(query_list)} query images')
+    for qid, qpath in query_list:
+        print(f'  Processing [{qid}]: {Path(qpath).stem}')
 
         img = Image.open(qpath).convert('RGB')
         orig_size = img.size  # (W, H)
@@ -146,18 +163,16 @@ def main():
         img = transform(img).unsqueeze(0).to(device)
 
         with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            # fresh copy of support memory for each query
             prev = {}
             for k, v in current_out.items():
                 prev[k] = [t.clone() for t in v] if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v
             out = model(img, prev_out=prev)
 
         logit_mask = out['logit_mask']
-        # Resize back to original resolution
         logit_mask = F.interpolate(logit_mask, (orig_size[1], orig_size[0]), mode='bilinear', align_corners=True)
         pred_mask = (logit_mask.squeeze() > 0.0).float().cpu().numpy() * 255
 
-        out_path = os.path.join(args.output_dir, name + '.png')
+        out_path = os.path.join(args.output_dir, f'{qid}.png')
         Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
         print(f'    Saved: {out_path}')
 

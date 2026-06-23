@@ -44,7 +44,7 @@ class DatasetCustom(Dataset):
         return len(self.img_metadata)
 
     def __getitem__(self, idx):
-        query_name, query_img, query_mask, support_names, support_imgs, support_masks, class_sample = self.sample_episode(idx)
+        query_id, query_name, query_img, query_mask, support_ids, support_names, support_imgs, support_masks, class_sample = self.sample_episode(idx)
 
         query_img = query_img.resize((self.img_size, self.img_size))
         if not self.use_original_imgsize:
@@ -57,10 +57,12 @@ class DatasetCustom(Dataset):
             support_masks[shot] = tv_tensors.Mask(F.interpolate(support_masks[shot].unsqueeze(0).unsqueeze(0).float(), (self.img_size, self.img_size), mode='nearest').squeeze())
             support_imgs[shot], support_masks[shot] = self.transform(support_imgs[shot], support_masks[shot])
 
-        batch = {'query_name': query_name,
+        batch = {'query_id': query_id,
+                 'query_name': query_name,
                  'query_img': query_img,
                  'query_mask': query_mask,
 
+                 'support_ids': support_ids,
                  'support_names': support_names,
                  'support_imgs': torch.stack(support_imgs),
                  'support_masks': torch.stack(support_masks),
@@ -72,7 +74,7 @@ class DatasetCustom(Dataset):
     def sample_episode(self, idx):
         rng = np.random.default_rng((self.seed, idx, self.epoch + 1))
 
-        query_name, query_class = self.img_metadata[idx]
+        query_id, query_name, query_class = self.img_metadata[idx]
         class_sample = self.classes.index(query_class)
 
         query_img = Image.open(self._find_image(query_class, query_name)).convert('RGB')
@@ -81,12 +83,14 @@ class DatasetCustom(Dataset):
         # sample k support images from the same class
         support_txt = os.path.join(self.base_path, query_class, 'support.txt')
         with open(support_txt, 'r') as f:
-            support_names = [line.strip() for line in f if line.strip()]
-        support_names = rng.choice(support_names, self.shot, replace=False).tolist()
-        support_imgs = [Image.open(self._find_image(query_class, name)).convert('RGB') for name in support_names]
-        support_masks = [self.read_mask(os.path.join(self.base_path, query_class, 'masks', name + '.png')) for name in support_names]
+            support_entries = [line.strip().split(',', 1) for line in f if line.strip()]
+        chosen = rng.choice(support_entries, self.shot, replace=False).tolist()
+        chosen_ids = [e[0] for e in chosen]
+        chosen_names = [e[1] for e in chosen]
+        support_imgs = [Image.open(self._find_image(query_class, name)).convert('RGB') for name in chosen_names]
+        support_masks = [self.read_mask(os.path.join(self.base_path, query_class, 'masks', name + '.png')) for name in chosen_names]
 
-        return query_name, query_img, query_mask, support_names, support_imgs, support_masks, class_sample
+        return query_id, query_name, query_img, query_mask, chosen_ids, chosen_names, support_imgs, support_masks, class_sample
 
     def _find_image(self, class_dir, name):
         for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
@@ -107,7 +111,9 @@ class DatasetCustom(Dataset):
             query_txt = os.path.join(self.base_path, cls, 'query.txt')
             with open(query_txt, 'r') as f:
                 for line in f:
-                    name = line.strip()
-                    if name:
-                        img_metadata.append((name, cls))
+                    line = line.strip()
+                    if not line:
+                        continue
+                    img_id, name = line.split(',', 1)
+                    img_metadata.append((img_id, name, cls))
         return img_metadata
