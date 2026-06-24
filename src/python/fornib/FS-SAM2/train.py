@@ -1,7 +1,9 @@
 """ FS-SAM2 training code """
 import os
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -12,8 +14,46 @@ from common.evaluation import Evaluator
 from common import utils
 from data.dataset import FSSDataset
 
+TASK_DIR = Path(__file__).resolve().parents[2] / "task"
+if str(TASK_DIR) not in sys.path:
+    sys.path.insert(0, str(TASK_DIR))
 
-def train(args, epoch, sam_model, dataloader, optimizer, scheduler, training, kshot=1):
+from dltool_task_protocol import TaskClient, TaskStatus
+
+
+class TaskStopRequested(Exception):
+    pass
+
+
+def create_task_client(args):
+    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
+        return None
+    return TaskClient(args.dltool_task_host, args.dltool_task_port)
+
+
+def task_progress(args, epoch, batch_index, batch_count, training):
+    phase_offset = 0.0 if training else 0.5
+    phase_fraction = 0.5 * (batch_index + 1) / max(1, batch_count)
+    return min(98, int(98 * (epoch + phase_offset + phase_fraction) / max(1, args.epochs)))
+
+
+def report_task_status(client, args, status, progress=None, message=""):
+    if client is not None and utils.is_main_process():
+        client.status(args.dltool_task_id, status, progress, message)
+
+
+def report_task_progress(client, args, progress, message=""):
+    if client is not None and utils.is_main_process():
+        client.progress(args.dltool_task_id, progress, message)
+
+
+def raise_if_task_stopped(client, args, progress=None):
+    if client is not None and utils.is_main_process() and client.should_stop(args.dltool_task_id):
+        report_task_status(client, args, TaskStatus.STOPPED, progress, "任务已停止")
+        raise TaskStopRequested()
+
+
+def train(args, epoch, sam_model, dataloader, optimizer, scheduler, training, kshot=1, task_client=None):
     """Training or validation of the model"""
     
     sam_model.train() if training else sam_model.eval()
@@ -21,6 +61,9 @@ def train(args, epoch, sam_model, dataloader, optimizer, scheduler, training, ks
     start_time = time.time()
 
     for idx, batch in enumerate(dataloader):
+        progress = task_progress(args, epoch, idx, len(dataloader), training)
+        raise_if_task_stopped(task_client, args, progress)
+
         batch_time = time.time()
         batch = utils.to_cuda(batch)
         
@@ -43,6 +86,8 @@ def train(args, epoch, sam_model, dataloader, optimizer, scheduler, training, ks
         area_inter, area_union, area_pred, area_gt = Evaluator.classify_prediction(pred_mask.squeeze(1), batch['query_mask'], batch.get('query_ignore_idx'))
         average_meter.update(area_inter, area_union, area_pred, area_gt, batch['class_id'], loss=loss.detach().clone())
         average_meter.write_process(idx, len(dataloader), epoch, write_batch_idx=100, dt=time.time()-batch_time)
+        report_task_progress(task_client, args, progress, f"Epoch {epoch + 1}/{args.epochs}")
+        raise_if_task_stopped(task_client, args, progress)
 
     # Write evaluation results
     torch.cuda.synchronize()
@@ -77,6 +122,9 @@ def main():
     parser.add_argument('--sam2_checkpoint', type=str, default='./checkpoint/sam2.1_hiera_base_plus.pt')
     parser.add_argument('--sam2_cfg', type=str, default='configs/sam2.1/sam2.1_hiera_b+.yaml')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--dltool_task_host', type=str, default='')
+    parser.add_argument('--dltool_task_port', type=int, default=0)
+    parser.add_argument('--dltool_task_id', type=int, default=-1)
     args = parser.parse_args()
 
     if args.logpath == '':  # if empty, autogenerate logpath from args
@@ -93,6 +141,9 @@ def main():
     else:
         local_rank = 0  # just 1 process
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    task_client = create_task_client(args) if utils.is_main_process() else None
+    report_task_status(task_client, args, TaskStatus.RUNNING, 0, "开始 FS-SAM2 训练")
     
     if utils.is_main_process():
         Logger.initialize(args, training=True)
@@ -179,31 +230,49 @@ def main():
     best_val_miou = float('-inf')
     best_val_loss = float('inf')
     val_loss, val_miou, val_fb_iou = 10, 0, 0
-    for epoch in range(args.epochs):
-        if utils.is_dist_avail_and_initialized():
-            dataloader_trn.sampler.set_epoch(epoch)  # shuffle dataset
-        dataloader_trn.dataset.set_epoch(epoch)  # randomize support-query pairs
-        trn_loss, trn_miou, trn_fb_iou = train(args, epoch, sam_model, dataloader_trn, optimizer, scheduler, training=True, kshot=args.kshot)  # training
-        
-        with torch.no_grad():
-            val_loss, val_miou, val_fb_iou = train(args, epoch, sam_model, dataloader_val, optimizer, scheduler, training=False, kshot=args.kshot)  # validation
- 
-        # Save the best model
-        if val_miou > best_val_miou:
-            best_val_miou = val_miou
+    try:
+        for epoch in range(args.epochs):
+            raise_if_task_stopped(task_client, args)
+            if utils.is_dist_avail_and_initialized():
+                dataloader_trn.sampler.set_epoch(epoch)  # shuffle dataset
+            dataloader_trn.dataset.set_epoch(epoch)  # randomize support-query pairs
+            trn_loss, trn_miou, trn_fb_iou = train(args, epoch, sam_model, dataloader_trn, optimizer, scheduler,
+                                                   training=True, kshot=args.kshot, task_client=task_client)  # training
+
+            with torch.no_grad():
+                val_loss, val_miou, val_fb_iou = train(args, epoch, sam_model, dataloader_val, optimizer, scheduler,
+                                                       training=False, kshot=args.kshot, task_client=task_client)  # validation
+
+            # Save the best model
+            if val_miou > best_val_miou:
+                best_val_miou = val_miou
+                if utils.is_main_process():
+                    Logger.save_model_miou(raw_model, epoch, val_miou)
             if utils.is_main_process():
-                Logger.save_model_miou(raw_model, epoch, val_miou)
-        if utils.is_main_process():
-            Logger.tbd_writer.add_scalars('data/loss', {'trn_loss': trn_loss, 'val_loss': val_loss}, epoch)
-            Logger.tbd_writer.add_scalars('data/miou', {'trn_miou': trn_miou, 'val_miou': val_miou}, epoch)
-            Logger.tbd_writer.add_scalars('data/fb_iou', {'trn_fb_iou': trn_fb_iou, 'val_fb_iou': val_fb_iou}, epoch)
-            Logger.tbd_writer.flush()
+                Logger.tbd_writer.add_scalars('data/loss', {'trn_loss': trn_loss, 'val_loss': val_loss}, epoch)
+                Logger.tbd_writer.add_scalars('data/miou', {'trn_miou': trn_miou, 'val_miou': val_miou}, epoch)
+                Logger.tbd_writer.add_scalars('data/fb_iou', {'trn_fb_iou': trn_fb_iou, 'val_fb_iou': val_fb_iou}, epoch)
+                Logger.tbd_writer.flush()
+    except TaskStopRequested:
+        if task_client is not None:
+            task_client.close()
+        return 130
+    except Exception as exc:
+        report_task_status(task_client, args, TaskStatus.FAILED, message=str(exc))
+        if task_client is not None:
+            task_client.close()
+        return 1
+    finally:
+        if utils.is_dist_avail_and_initialized():
+            dist.destroy_process_group()
+
     Logger.tbd_writer.close()
     Logger.info('==================== Finished Training ====================')
-
-    if utils.is_dist_avail_and_initialized():
-        dist.destroy_process_group()
+    report_task_status(task_client, args, TaskStatus.FINISHED, 100, "训练完成")
+    if task_client is not None:
+        task_client.close()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -10,6 +10,28 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 
+SAM2_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "facebookresearch" / "sam2" / "sam2" / "configs"
+
+
+def normalize_sam2_config(model_cfg):
+    if model_cfg is None:
+        return None
+
+    normalized = str(model_cfg).replace("\\", "/")
+    config_path = Path(model_cfg)
+    if not config_path.is_absolute():
+        if normalized.startswith("configs/"):
+            return normalized
+        if normalized.startswith("sam2/") or normalized.startswith("sam2.1/"):
+            return f"configs/{normalized}"
+        return normalized
+
+    try:
+        relative = config_path.resolve().relative_to(SAM2_CONFIG_ROOT.resolve())
+    except ValueError:
+        return normalized
+    return f"configs/{relative.as_posix()}"
+
 
 def dice_loss(
         inputs: torch.Tensor,
@@ -54,6 +76,7 @@ class SAM2_pred(nn.Module):
             checkpoint = "./checkpoint/sam2.1_hiera_base_plus.pt"
         if model_cfg is None:
             model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+        model_cfg = normalize_sam2_config(model_cfg)
         self.model = build_sam2(model_cfg, checkpoint)
 
         # loss functions

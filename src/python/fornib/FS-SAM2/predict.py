@@ -12,8 +12,45 @@ import PIL.Image as Image
 from torchvision import tv_tensors
 from torchvision.transforms import v2
 
+TASK_DIR = Path(__file__).resolve().parents[2] / "task"
+if str(TASK_DIR) not in sys.path:
+    sys.path.insert(0, str(TASK_DIR))
 
-def load_support(support_dir, img_size, transform, device):
+from dltool_task_protocol import TaskClient, TaskStatus
+
+
+class TaskStopRequested(Exception):
+    pass
+
+
+def create_task_client(args):
+    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
+        return None
+    return TaskClient(args.dltool_task_host, args.dltool_task_port)
+
+
+def task_progress(args, done, total):
+    progress = args.dltool_progress_base + args.dltool_progress_span * done / max(1, total)
+    return min(100, max(0, int(progress)))
+
+
+def report_task_status(client, args, status, progress=None, message=""):
+    if client is not None:
+        client.status(args.dltool_task_id, status, progress, message)
+
+
+def report_task_progress(client, args, progress, message=""):
+    if client is not None:
+        client.progress(args.dltool_task_id, progress, message)
+
+
+def raise_if_task_stopped(client, args, progress=None):
+    if client is not None and client.should_stop(args.dltool_task_id):
+        report_task_status(client, args, TaskStatus.STOPPED, progress, "任务已停止")
+        raise TaskStopRequested()
+
+
+def load_support(support_dir, img_size, transform, device, task_client=None, args=None):
     """Load all support images and masks from a directory with images/ and masks/ subdirs."""
     img_dir = os.path.join(support_dir, 'images')
     mask_dir = os.path.join(support_dir, 'masks')
@@ -25,6 +62,8 @@ def load_support(support_dir, img_size, transform, device):
     imgs, masks, names = [], [], []
     for ext in ('*.jpg', '*.jpeg', '*.png'):
         for img_path in sorted(glob.glob(os.path.join(img_dir, ext))):
+            if args is not None:
+                raise_if_task_stopped(task_client, args, args.dltool_progress_base)
             name = Path(img_path).stem
             mask_path = os.path.join(mask_dir, name + '.png')
             if not os.path.exists(mask_path):
@@ -96,7 +135,16 @@ def main():
     parser.add_argument('--sam2_cfg', type=str, default='configs/sam2.1/sam2.1_hiera_b+.yaml')
     parser.add_argument('--kshot', type=int, default=1, help='Number of support images to use (default 1)')
     parser.add_argument('--img_size', type=int, default=1024, help='Image size for inference (default 1024)')
+    parser.add_argument('--dltool_task_host', type=str, default='')
+    parser.add_argument('--dltool_task_port', type=int, default=0)
+    parser.add_argument('--dltool_task_id', type=int, default=-1)
+    parser.add_argument('--dltool_progress_base', type=int, default=0)
+    parser.add_argument('--dltool_progress_span', type=int, default=100)
+    parser.add_argument('--dltool_finish_on_complete', action='store_true')
     args = parser.parse_args()
+
+    task_client = create_task_client(args)
+    report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, "开始 FS-SAM2 推理")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('high')
@@ -111,71 +159,95 @@ def main():
         v2.Normalize(img_mean, img_std),
     ])
 
-    # Load model
-    print(f'Loading checkpoint: {args.checkpoint}')
-    model = setup_model(args.checkpoint, device, args.sam2_checkpoint, args.sam2_cfg)
+    try:
+        # Load model
+        raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+        print(f'Loading checkpoint: {args.checkpoint}')
+        model = setup_model(args.checkpoint, device, args.sam2_checkpoint, args.sam2_cfg)
 
-    # Load support images
-    support_imgs, support_masks, _ = load_support(args.support_dir, args.img_size, transform, device)
+        # Load support images
+        support_imgs, support_masks, _ = load_support(args.support_dir, args.img_size, transform, device,
+                                                      task_client, args)
 
-    # Use only kshot support images
-    total = len(support_imgs)
-    if args.kshot < total:
-        support_imgs = support_imgs[:args.kshot]
-        support_masks = support_masks[:args.kshot]
-        print(f'Using {args.kshot} of {total} support images (controlled by --kshot)')
+        # Use only kshot support images
+        total = len(support_imgs)
+        if args.kshot < total:
+            support_imgs = support_imgs[:args.kshot]
+            support_masks = support_masks[:args.kshot]
+            print(f'Using {args.kshot} of {total} support images (controlled by --kshot)')
 
-    # Pre-compute support memory once
-    print('Encoding support images...')
-    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        current_out = {}
-        for i in range(len(support_imgs)):
-            current_out = model(support_imgs[i].unsqueeze(0), support_masks[i].unsqueeze(0), prev_out=current_out)
-    print('Support encoding done.')
-
-    # Build query list — use query.txt if present, else all images in dir
-    query_txt = os.path.join(args.query_dir, 'query.txt')
-    if os.path.exists(query_txt):
-        query_list = []
-        with open(query_txt, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                qid, qname = line.split(',', 1)
-                for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
-                    p = os.path.join(args.query_dir, qname + ext)
-                    if os.path.exists(p):
-                        query_list.append((qid, p))
-                        break
-                else:
-                    print(f'  Skip (no image): {qname}')
-    else:
-        query_list = [(Path(p).stem, p) for p in load_queries(args.query_dir)]
-
-    print(f'Found {len(query_list)} query images')
-    for qid, qpath in query_list:
-        print(f'  Processing [{qid}]: {Path(qpath).stem}')
-
-        img = Image.open(qpath).convert('RGB')
-        orig_size = img.size  # (W, H)
-        img = img.resize((args.img_size, args.img_size))
-        img = transform(img).unsqueeze(0).to(device)
-
+        # Pre-compute support memory once
+        print('Encoding support images...')
         with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            prev = {}
-            for k, v in current_out.items():
-                prev[k] = [t.clone() for t in v] if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v
-            out = model(img, prev_out=prev)
+            current_out = {}
+            for i in range(len(support_imgs)):
+                raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+                current_out = model(support_imgs[i].unsqueeze(0), support_masks[i].unsqueeze(0), prev_out=current_out)
+        print('Support encoding done.')
 
-        logit_mask = out['logit_mask']
-        logit_mask = F.interpolate(logit_mask, (orig_size[1], orig_size[0]), mode='bilinear', align_corners=True)
-        pred_mask = (logit_mask.squeeze() > 0.0).float().cpu().numpy() * 255
+        # Build query list — use query.txt if present, else all images in dir
+        query_txt = os.path.join(args.query_dir, 'query.txt')
+        if os.path.exists(query_txt):
+            query_list = []
+            with open(query_txt, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    qid, qname = line.split(',', 1)
+                    for ext in ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG'):
+                        p = os.path.join(args.query_dir, qname + ext)
+                        if os.path.exists(p):
+                            query_list.append((qid, p))
+                            break
+                    else:
+                        print(f'  Skip (no image): {qname}')
+        else:
+            query_list = [(Path(p).stem, p) for p in load_queries(args.query_dir)]
 
-        out_path = os.path.join(args.output_dir, f'{qid}.png')
-        Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
-        print(f'    Saved: {out_path}')
+        print(f'Found {len(query_list)} query images')
+        for index, (qid, qpath) in enumerate(query_list):
+            progress = task_progress(args, index, len(query_list))
+            raise_if_task_stopped(task_client, args, progress)
+            print(f'  Processing [{qid}]: {Path(qpath).stem}')
+
+            img = Image.open(qpath).convert('RGB')
+            orig_size = img.size  # (W, H)
+            img = img.resize((args.img_size, args.img_size))
+            img = transform(img).unsqueeze(0).to(device)
+
+            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                prev = {}
+                for k, v in current_out.items():
+                    prev[k] = [t.clone() for t in v] if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v
+                out = model(img, prev_out=prev)
+
+            logit_mask = out['logit_mask']
+            logit_mask = F.interpolate(logit_mask, (orig_size[1], orig_size[0]), mode='bilinear', align_corners=True)
+            pred_mask = (logit_mask.squeeze() > 0.0).float().cpu().numpy() * 255
+
+            out_path = os.path.join(args.output_dir, f'{qid}.png')
+            Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
+            progress = task_progress(args, index + 1, len(query_list))
+            report_task_progress(task_client, args, progress, f"已推理 {index + 1}/{len(query_list)}")
+            raise_if_task_stopped(task_client, args, progress)
+            print(f'    Saved: {out_path}')
+
+        finish_progress = task_progress(args, len(query_list), len(query_list))
+        if args.dltool_finish_on_complete:
+            report_task_status(task_client, args, TaskStatus.FINISHED, 100, "推理完成")
+        else:
+            report_task_progress(task_client, args, finish_progress, "当前类别推理完成")
+        return 0
+    except TaskStopRequested:
+        return 130
+    except Exception as exc:
+        report_task_status(task_client, args, TaskStatus.FAILED, message=str(exc))
+        return 1
+    finally:
+        if task_client is not None:
+            task_client.close()
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
