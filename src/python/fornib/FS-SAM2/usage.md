@@ -33,9 +33,28 @@ your_dataset/
 
 | 维度 | 最低 | 建议 |
 |------|------|------|
-| 类别数 | ≥2 | ≥5 |
+| 类别数 | ≥1 | ≥5 |
+| 每类图像总数 | ≥kshot + 1 | 6-10 张 |
 | 每类 support 图像 | ≥kshot | 3-5 张 |
 | 每类 query 图像 | ≥1 | 3-5 张 |
+
+- **单类支持**：只有 1 个类时，train/val 使用相同类别（不同 support/query 图像）
+- 多类时 train/val 类别按 80/20 划分且不重叠
+- `support.txt` 条目数 ≥ kshot，否则 `rng.choice` 无放回采样会报错
+- `query.txt` 至少 1 条，否则 dataloader 没有 episode 可采，`loss_buf` 为空导致 `torch.stack` 崩溃
+
+### 检测项目（矩形框标注）
+
+检测项目标注为矩形框，需先通过 **SAM2 box→mask** 将框转为掩码，再做训练：
+
+```
+矩形框 → box_to_mask.py (SAM2 box prompt) → masks/ → train.py → predict.py → masks → 矩形框导入
+```
+
+- 框数据由 C++ 侧导出为 `boxes.json`（每类目录下）
+- `box_to_mask.py` 逐类调用 SAM2 生成掩码，合并多框（逻辑或），保存到 `masks/`
+- 训练/推理流程与分割项目完全一致
+- 推理结果导入时 `MaskImporter` 自动将 mask 转回矩形框（检测项目）
 
 
 ### LabelMe 转 custom 格式

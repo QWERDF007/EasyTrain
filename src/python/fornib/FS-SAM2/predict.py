@@ -6,6 +6,7 @@ import glob
 from pathlib import Path
 
 import numpy as np
+import traceback
 import torch
 import torch.nn.functional as F
 import PIL.Image as Image
@@ -241,8 +242,8 @@ def main():
         return 0
     except TaskStopRequested:
         return 130
-    except Exception as exc:
-        report_task_status(task_client, args, TaskStatus.FAILED, message=str(exc))
+    except Exception:
+        report_task_status(task_client, args, TaskStatus.FAILED, message=traceback.format_exc())
         return 1
     finally:
         if task_client is not None:

@@ -3,6 +3,7 @@ import os
 import argparse
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import torch
@@ -257,8 +258,8 @@ def main():
         if task_client is not None:
             task_client.close()
         return 130
-    except Exception as exc:
-        report_task_status(task_client, args, TaskStatus.FAILED, message=str(exc))
+    except Exception:
+        report_task_status(task_client, args, TaskStatus.FAILED, message=traceback.format_exc())
         if task_client is not None:
             task_client.close()
         return 1

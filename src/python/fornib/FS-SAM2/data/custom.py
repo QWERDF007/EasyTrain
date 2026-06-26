@@ -33,6 +33,8 @@ class DatasetCustom(Dataset):
             self.classes = self.all_classes[:n_train]
         else:  # val or test
             self.classes = self.all_classes[n_train:]
+            if not self.classes:
+                self.classes = self.all_classes[:]  # 单类时 val 复用全部类
 
         self.class_ids = list(range(len(self.classes)))
         self.img_metadata = self.build_img_metadata()

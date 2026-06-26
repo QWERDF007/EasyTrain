@@ -58,7 +58,7 @@ class AverageMeter:
         # loss_buf = torch.stack(self.loss_buf)
         msg = '\n*** %s ' % split
         msg += '[@Epoch %02d] ' % epoch if epoch != -1 else ''
-        if epoch != -1:
+        if epoch != -1 and self.loss_buf:
             loss_buf = torch.stack(self.loss_buf)
             loss_buf = self.reduce_metrics([loss_buf])[0]
             msg += 'Avg L: %6.5f  ' % loss_buf.mean()
