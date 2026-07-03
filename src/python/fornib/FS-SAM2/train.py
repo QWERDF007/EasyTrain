@@ -154,7 +154,7 @@ def main():
 
     # Dataset initialization
     FSSDataset.initialize(img_size=args.img_size, datapath=args.datapath, use_original_imgsize=False)
-    dataloader_trn = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'trn', args.kshot, seed=args.seed)
+    dataloader_trn = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'train', args.kshot, seed=args.seed)
     dataloader_val = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'val', args.kshot, seed=args.seed)
 
     Evaluator.initialize(args.use_ignore)

@@ -29,7 +29,7 @@ class DatasetCustom(Dataset):
         self.nclass = len(self.all_classes)
 
         n_train = max(1, int(len(self.all_classes) * 0.8))
-        if split == 'trn':
+        if split == 'train':
             self.classes = self.all_classes[:n_train]
         else:  # val or test
             self.classes = self.all_classes[n_train:]
