@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from common.logger import Logger, AverageMeter
 from common.evaluation import Evaluator
@@ -24,6 +25,62 @@ from dltool_task_protocol import TaskClient, TaskStatus
 
 class TaskStopRequested(Exception):
     pass
+
+
+def build_custom_dataloader(args, datapath, training):
+    from data.custom import DatasetCustom
+
+    dataset = DatasetCustom(
+        datapath,
+        fold=args.fold,
+        transform=FSSDataset.transform_train if training else FSSDataset.transform,
+        split='train' if training else 'val',
+        shot=args.kshot,
+        img_size=args.img_size,
+        use_original_imgsize=False,
+        seed=args.seed,
+    )
+    dataset.classes = dataset.all_classes[:]
+    dataset.class_ids = list(range(len(dataset.classes)))
+    dataset.img_metadata = dataset.build_img_metadata()
+
+    shuffle = training
+    if utils.is_dist_avail_and_initialized():
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=shuffle)
+        shuffle = False
+    else:
+        sampler = None
+
+    return DataLoader(
+        dataset,
+        batch_size=args.bsz,
+        shuffle=shuffle,
+        pin_memory=True,
+        num_workers=args.nworker,
+        sampler=sampler,
+    )
+
+
+def build_train_val_dataloaders(args):
+    val_datapath = args.val_datapath or args.datapath
+
+    FSSDataset.initialize(img_size=args.img_size, datapath=args.datapath, use_original_imgsize=False)
+    if args.benchmark == 'custom':
+        dataloader_trn = build_custom_dataloader(args, args.datapath, training=True)
+    else:
+        dataloader_trn = FSSDataset.build_dataloader(
+            args.benchmark, args.bsz, args.nworker, args.fold, 'train', args.kshot, seed=args.seed
+        )
+
+    FSSDataset.initialize(img_size=args.img_size, datapath=val_datapath, use_original_imgsize=False)
+    if args.benchmark == 'custom':
+        dataloader_val = build_custom_dataloader(args, val_datapath, training=False)
+    else:
+        dataloader_val = FSSDataset.build_dataloader(
+            args.benchmark, args.bsz, args.nworker, args.fold, 'val', args.kshot, seed=args.seed
+        )
+
+    return dataloader_trn, dataloader_val
 
 
 def create_task_client(args):
@@ -108,6 +165,7 @@ def main():
     # Arguments parsing
     parser = argparse.ArgumentParser(description='FS-SAM2 Pytorch Implementation')
     parser.add_argument('--datapath', type=str, default='../datasets/')  # CHANGE TO YOUR PATH
+    parser.add_argument('--val_datapath', type=str, default='')
     parser.add_argument('--benchmark', type=str, default='pascal', choices=['pascal', 'coco', 'fss', 'custom'])
     parser.add_argument('--exp_id', type=str, default='0000')
     parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3])
@@ -153,9 +211,7 @@ def main():
     torch.set_float32_matmul_precision('high')  # use Tensor Cores (slightly less precision)
 
     # Dataset initialization
-    FSSDataset.initialize(img_size=args.img_size, datapath=args.datapath, use_original_imgsize=False)
-    dataloader_trn = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'train', args.kshot, seed=args.seed)
-    dataloader_val = FSSDataset.build_dataloader(args.benchmark, args.bsz, args.nworker, args.fold, 'val', args.kshot, seed=args.seed)
+    dataloader_trn, dataloader_val = build_train_val_dataloaders(args)
 
     Evaluator.initialize(args.use_ignore)
 
