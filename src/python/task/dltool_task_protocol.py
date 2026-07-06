@@ -11,6 +11,7 @@ class ProtocolField(Enum):
     TYPE = "type"
     STATUS = "status"
     PROGRESS = "progress"
+    ETA_SECONDS = "eta_seconds"
     MESSAGE = "message"
     COMMAND = "command"
 
@@ -81,9 +82,8 @@ class AsyncTaskClient:
                 pass
             self._writer = None
 
-    async def send(self, task_id: int, msg_type: MessageType = MessageType.EVENT,
-                   status: Optional[TaskStatus] = None, progress: Optional[int] = None,
-                   message: str = "", **payload: Any) -> None:
+    async def send(self, task_id: int, msg_type: MessageType, status: Optional[TaskStatus],
+                   progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
         if self._closed or self._writer is None:
             return
 
@@ -93,8 +93,9 @@ class AsyncTaskClient:
         }
         if status is not None:
             data[ProtocolField.STATUS.value] = protocol_value(status)
-        if progress is not None:
+        if progress >= 0:
             data[ProtocolField.PROGRESS.value] = max(0, min(100, int(progress)))
+        data[ProtocolField.ETA_SECONDS.value] = max(-1, int(eta_seconds))
         if message:
             data[ProtocolField.MESSAGE.value] = message
         data.update(payload)
@@ -105,12 +106,12 @@ class AsyncTaskClient:
                 self._writer.write(raw)
                 await self._writer.drain()
 
-    async def status(self, task_id: int, status: TaskStatus, progress: Optional[int] = None,
+    async def status(self, task_id: int, status: TaskStatus, progress: int, eta_seconds: int,
                      message: str = "") -> None:
-        await self.send(task_id, MessageType.STATUS, status=status, progress=progress, message=message)
+        await self.send(task_id, MessageType.STATUS, status, progress, eta_seconds, message)
 
-    async def progress(self, task_id: int, progress: int, message: str = "") -> None:
-        await self.send(task_id, MessageType.PROGRESS, progress=progress, message=message)
+    async def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "") -> None:
+        await self.send(task_id, MessageType.PROGRESS, None, progress, eta_seconds, message)
 
     async def should_stop(self, *task_ids: int) -> bool:
         expected = {int(task_id) for task_id in task_ids}
@@ -188,22 +189,22 @@ class TaskClient:
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=5)
 
-    def send(self, task_id: int, msg_type: MessageType = MessageType.EVENT,
-             status: Optional[TaskStatus] = None, progress: Optional[int] = None,
-             message: str = "", **payload: Any) -> None:
+    def send(self, task_id: int, msg_type: MessageType, status: Optional[TaskStatus],
+             progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
         if self._closed:
             return
-        self._submit(self._client.send(task_id, msg_type, status, progress, message, **payload)).result(timeout=5)
+        self._submit(self._client.send(task_id, msg_type, status, progress, eta_seconds, message,
+                                       **payload)).result(timeout=5)
 
-    def status(self, task_id: int, status: TaskStatus, progress: Optional[int] = None, message: str = "") -> None:
+    def status(self, task_id: int, status: TaskStatus, progress: int, eta_seconds: int, message: str = "") -> None:
         if self._closed:
             return
-        self._submit(self._client.status(task_id, status, progress, message)).result(timeout=5)
+        self._submit(self._client.status(task_id, status, progress, eta_seconds, message)).result(timeout=5)
 
-    def progress(self, task_id: int, progress: int, message: str = "") -> None:
+    def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "") -> None:
         if self._closed:
             return
-        self._submit(self._client.progress(task_id, progress, message)).result(timeout=5)
+        self._submit(self._client.progress(task_id, progress, eta_seconds, message)).result(timeout=5)
 
     def should_stop(self, *task_ids: int) -> bool:
         if self._closed:

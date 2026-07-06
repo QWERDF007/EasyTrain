@@ -95,19 +95,34 @@ def task_progress(args, epoch, batch_index, batch_count, training):
     return min(98, int(98 * (epoch + phase_offset + phase_fraction) / max(1, args.epochs)))
 
 
-def report_task_status(client, args, status, progress=None, message=""):
+def estimate_task_eta(args):
+    completed_steps = getattr(args, "dltool_completed_steps", 0)
+    total_steps = getattr(args, "dltool_total_steps", 0)
+    start_time = getattr(args, "dltool_eta_start_time", None)
+    if completed_steps <= 0 or total_steps <= 0 or start_time is None:
+        return -1
+
+    elapsed = time.time() - start_time
+    if elapsed <= 0:
+        return -1
+
+    remaining_steps = max(0, total_steps - completed_steps)
+    return int(round(elapsed * remaining_steps / completed_steps))
+
+
+def report_task_status(client, args, status, progress, eta_seconds, message):
     if client is not None and utils.is_main_process():
-        client.status(args.dltool_task_id, status, progress, message)
+        client.status(args.dltool_task_id, status, progress, eta_seconds, message)
 
 
-def report_task_progress(client, args, progress, message=""):
+def report_task_progress(client, args, progress, eta_seconds, message):
     if client is not None and utils.is_main_process():
-        client.progress(args.dltool_task_id, progress, message)
+        client.progress(args.dltool_task_id, progress, eta_seconds, message)
 
 
-def raise_if_task_stopped(client, args, progress=None):
+def raise_if_task_stopped(client, args, progress=-1):
     if client is not None and utils.is_main_process() and client.should_stop(args.dltool_task_id):
-        report_task_status(client, args, TaskStatus.STOPPED, progress, "任务已停止")
+        report_task_status(client, args, TaskStatus.STOPPED, progress, estimate_task_eta(args), "任务已停止")
         raise TaskStopRequested()
 
 
@@ -144,7 +159,8 @@ def train(args, epoch, sam_model, dataloader, optimizer, scheduler, training, ks
         area_inter, area_union, area_pred, area_gt = Evaluator.classify_prediction(pred_mask.squeeze(1), batch['query_mask'], batch.get('query_ignore_idx'))
         average_meter.update(area_inter, area_union, area_pred, area_gt, batch['class_id'], loss=loss.detach().clone())
         average_meter.write_process(idx, len(dataloader), epoch, write_batch_idx=100, dt=time.time()-batch_time)
-        report_task_progress(task_client, args, progress, f"Epoch {epoch + 1}/{args.epochs}")
+        args.dltool_completed_steps = getattr(args, "dltool_completed_steps", 0) + 1
+        report_task_progress(task_client, args, progress, estimate_task_eta(args), f"Epoch {epoch + 1}/{args.epochs}")
         raise_if_task_stopped(task_client, args, progress)
 
     # Write evaluation results
@@ -202,7 +218,7 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     task_client = create_task_client(args) if utils.is_main_process() else None
-    report_task_status(task_client, args, TaskStatus.RUNNING, 0, "开始 FS-SAM2 训练")
+    report_task_status(task_client, args, TaskStatus.RUNNING, 0, -1, "开始 FS-SAM2 训练")
     
     if utils.is_main_process():
         Logger.initialize(args, training=True)
@@ -212,6 +228,7 @@ def main():
 
     # Dataset initialization
     dataloader_trn, dataloader_val = build_train_val_dataloaders(args)
+    args.dltool_total_steps = max(1, args.epochs * (len(dataloader_trn) + len(dataloader_val)))
 
     Evaluator.initialize(args.use_ignore)
 
@@ -287,6 +304,8 @@ def main():
     best_val_miou = float('-inf')
     best_val_loss = float('inf')
     val_loss, val_miou, val_fb_iou = 10, 0, 0
+    args.dltool_completed_steps = 0
+    args.dltool_eta_start_time = time.time()
     try:
         for epoch in range(args.epochs):
             raise_if_task_stopped(task_client, args)
@@ -299,6 +318,10 @@ def main():
             with torch.no_grad():
                 val_loss, val_miou, val_fb_iou = train(args, epoch, sam_model, dataloader_val, optimizer, scheduler,
                                                        training=False, kshot=args.kshot, task_client=task_client)  # validation
+
+            epoch_progress = min(98, int(98 * (epoch + 1) / max(1, args.epochs)))
+            report_task_progress(task_client, args, epoch_progress, estimate_task_eta(args),
+                                 f"Epoch {epoch + 1}/{args.epochs} 完成")
 
             # Save the best model
             if val_miou > best_val_miou:
@@ -315,7 +338,7 @@ def main():
             task_client.close()
         return 130
     except Exception:
-        report_task_status(task_client, args, TaskStatus.FAILED, message=traceback.format_exc())
+        report_task_status(task_client, args, TaskStatus.FAILED, -1, -1, traceback.format_exc())
         if task_client is not None:
             task_client.close()
         return 1
@@ -325,7 +348,7 @@ def main():
 
     Logger.tbd_writer.close()
     Logger.info('==================== Finished Training ====================')
-    report_task_status(task_client, args, TaskStatus.FINISHED, 100, "训练完成")
+    report_task_status(task_client, args, TaskStatus.FINISHED, 100, 0, "训练完成")
     if task_client is not None:
         task_client.close()
     return 0

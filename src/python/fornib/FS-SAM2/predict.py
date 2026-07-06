@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import glob
+import time
 from pathlib import Path
 
 import numpy as np
@@ -35,19 +36,33 @@ def task_progress(args, done, total):
     return min(100, max(0, int(progress)))
 
 
-def report_task_status(client, args, status, progress=None, message=""):
+def estimate_task_eta(args, done, total):
+    start_time = getattr(args, "dltool_eta_start_time", None)
+    if start_time is None or done <= 0:
+        return -1
+
+    elapsed = time.time() - start_time
+    completed_span = args.dltool_progress_span * done / max(1, total)
+    if elapsed <= 0 or completed_span <= 0:
+        return -1
+
+    remaining_span = max(0.0, 100.0 - args.dltool_progress_base - completed_span)
+    return int(round(elapsed * remaining_span / completed_span))
+
+
+def report_task_status(client, args, status, progress, eta_seconds, message):
     if client is not None:
-        client.status(args.dltool_task_id, status, progress, message)
+        client.status(args.dltool_task_id, status, progress, eta_seconds, message)
 
 
-def report_task_progress(client, args, progress, message=""):
+def report_task_progress(client, args, progress, eta_seconds, message):
     if client is not None:
-        client.progress(args.dltool_task_id, progress, message)
+        client.progress(args.dltool_task_id, progress, eta_seconds, message)
 
 
-def raise_if_task_stopped(client, args, progress=None):
+def raise_if_task_stopped(client, args, progress=-1, eta_seconds=-1):
     if client is not None and client.should_stop(args.dltool_task_id):
-        report_task_status(client, args, TaskStatus.STOPPED, progress, "任务已停止")
+        report_task_status(client, args, TaskStatus.STOPPED, progress, eta_seconds, "任务已停止")
         raise TaskStopRequested()
 
 
@@ -64,7 +79,7 @@ def load_support(support_dir, img_size, transform, device, task_client=None, arg
     for ext in ('*.jpg', '*.jpeg', '*.png'):
         for img_path in sorted(glob.glob(os.path.join(img_dir, ext))):
             if args is not None:
-                raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+                raise_if_task_stopped(task_client, args, args.dltool_progress_base, -1)
             name = Path(img_path).stem
             mask_path = os.path.join(mask_dir, name + '.png')
             if not os.path.exists(mask_path):
@@ -145,7 +160,7 @@ def main():
     args = parser.parse_args()
 
     task_client = create_task_client(args)
-    report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, "开始 FS-SAM2 推理")
+    report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 FS-SAM2 推理")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('high')
@@ -162,7 +177,7 @@ def main():
 
     try:
         # Load model
-        raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+        raise_if_task_stopped(task_client, args, args.dltool_progress_base, -1)
         print(f'Loading checkpoint: {args.checkpoint}')
         model = setup_model(args.checkpoint, device, args.sam2_checkpoint, args.sam2_cfg)
 
@@ -182,7 +197,7 @@ def main():
         with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             current_out = {}
             for i in range(len(support_imgs)):
-                raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+                raise_if_task_stopped(task_client, args, args.dltool_progress_base, -1)
                 current_out = model(support_imgs[i].unsqueeze(0), support_masks[i].unsqueeze(0), prev_out=current_out)
         print('Support encoding done.')
 
@@ -207,9 +222,10 @@ def main():
             query_list = [(Path(p).stem, p) for p in load_queries(args.query_dir)]
 
         print(f'Found {len(query_list)} query images')
+        args.dltool_eta_start_time = time.time()
         for index, (qid, qpath) in enumerate(query_list):
             progress = task_progress(args, index, len(query_list))
-            raise_if_task_stopped(task_client, args, progress)
+            raise_if_task_stopped(task_client, args, progress, estimate_task_eta(args, index, len(query_list)))
             print(f'  Processing [{qid}]: {Path(qpath).stem}')
 
             img = Image.open(qpath).convert('RGB')
@@ -230,20 +246,22 @@ def main():
             out_path = os.path.join(args.output_dir, f'{qid}.png')
             Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
             progress = task_progress(args, index + 1, len(query_list))
-            report_task_progress(task_client, args, progress, f"已推理 {index + 1}/{len(query_list)}")
-            raise_if_task_stopped(task_client, args, progress)
+            eta_seconds = estimate_task_eta(args, index + 1, len(query_list))
+            report_task_progress(task_client, args, progress, eta_seconds, f"已推理 {index + 1}/{len(query_list)}")
+            raise_if_task_stopped(task_client, args, progress, eta_seconds)
             print(f'    Saved: {out_path}')
 
         finish_progress = task_progress(args, len(query_list), len(query_list))
+        finish_eta = 0 if args.dltool_finish_on_complete else estimate_task_eta(args, len(query_list), len(query_list))
         if args.dltool_finish_on_complete:
-            report_task_status(task_client, args, TaskStatus.FINISHED, 100, "推理完成")
+            report_task_status(task_client, args, TaskStatus.FINISHED, 100, 0, "推理完成")
         else:
-            report_task_progress(task_client, args, finish_progress, "当前类别推理完成")
+            report_task_progress(task_client, args, finish_progress, finish_eta, "当前类别推理完成")
         return 0
     except TaskStopRequested:
         return 130
     except Exception:
-        report_task_status(task_client, args, TaskStatus.FAILED, message=traceback.format_exc())
+        report_task_status(task_client, args, TaskStatus.FAILED, -1, -1, traceback.format_exc())
         return 1
     finally:
         if task_client is not None:

@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -38,19 +39,33 @@ def task_progress(args, done, total):
     return min(100, max(0, int(progress)))
 
 
-def report_task_status(client, args, status, progress=None, message=""):
+def estimate_task_eta(args, done, total):
+    start_time = getattr(args, "dltool_eta_start_time", None)
+    if start_time is None or done <= 0:
+        return -1
+
+    elapsed = time.time() - start_time
+    completed_span = args.dltool_progress_span * done / max(1, total)
+    if elapsed <= 0 or completed_span <= 0:
+        return -1
+
+    remaining_span = max(0.0, 100.0 - args.dltool_progress_base - completed_span)
+    return int(round(elapsed * remaining_span / completed_span))
+
+
+def report_task_status(client, args, status, progress, eta_seconds, message):
     if client is not None:
-        client.status(args.dltool_task_id, status, progress, message)
+        client.status(args.dltool_task_id, status, progress, eta_seconds, message)
 
 
-def report_task_progress(client, args, progress, message=""):
+def report_task_progress(client, args, progress, eta_seconds, message):
     if client is not None:
-        client.progress(args.dltool_task_id, progress, message)
+        client.progress(args.dltool_task_id, progress, eta_seconds, message)
 
 
-def raise_if_task_stopped(client, args, progress=None):
+def raise_if_task_stopped(client, args, progress=-1, eta_seconds=-1):
     if client is not None and client.should_stop(args.dltool_task_id):
-        report_task_status(client, args, TaskStatus.STOPPED, progress, "任务已停止")
+        report_task_status(client, args, TaskStatus.STOPPED, progress, eta_seconds, "任务已停止")
         raise TaskStopRequested()
 
 
@@ -114,7 +129,7 @@ def main():
 
     task_client = create_task_client(args)
     report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base,
-                       "开始 SAM2 框转Mask")
+                       -1, "开始 SAM2 框转Mask")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('high')
@@ -125,11 +140,13 @@ def main():
 
     if not os.path.isdir(image_dir):
         report_task_status(task_client, args, TaskStatus.FAILED,
+                           -1,
+                           -1,
                            message=f"Images directory not found: {image_dir}")
         return 1
 
     try:
-        raise_if_task_stopped(task_client, args, args.dltool_progress_base)
+        raise_if_task_stopped(task_client, args, args.dltool_progress_base, -1)
 
         # Load boxes
         boxes_data = load_boxes(args.support_dir)
@@ -137,6 +154,7 @@ def main():
             print(f'No boxes found in {args.support_dir}, skipping.')
             report_task_status(task_client, args, TaskStatus.FINISHED,
                                args.dltool_progress_base + args.dltool_progress_span,
+                               0,
                                "无需处理的框")
             return 0
 
@@ -146,15 +164,18 @@ def main():
         print('SAM2 model loaded.')
 
         total = len(boxes_data)
+        args.dltool_eta_start_time = time.time()
         for idx, (alias, box_list) in enumerate(boxes_data.items()):
             progress = task_progress(args, idx, total)
-            raise_if_task_stopped(task_client, args, progress)
+            raise_if_task_stopped(task_client, args, progress, estimate_task_eta(args, idx, total))
 
             # Find image file
             img_path = find_image_file(image_dir, alias)
             if img_path is None:
                 print(f'  Skip (no image): {alias}')
-                report_task_progress(task_client, args, progress,
+                done_progress = task_progress(args, idx + 1, total)
+                report_task_progress(task_client, args, done_progress,
+                                     estimate_task_eta(args, idx + 1, total),
                                      f"跳过 (无图像): {alias}")
                 continue
 
@@ -197,18 +218,22 @@ def main():
             out_path = os.path.join(mask_dir, alias + '.png')
             Image.fromarray(merged).save(out_path)
 
-            report_task_progress(task_client, args, progress,
+            done_progress = task_progress(args, idx + 1, total)
+            report_task_progress(task_client, args, done_progress,
+                                 estimate_task_eta(args, idx + 1, total),
                                  f"已处理 {idx + 1}/{total}")
             print(f'    Saved: {out_path}')
 
         finish_progress = task_progress(args, total, total)
         report_task_status(task_client, args, TaskStatus.FINISHED,
-                           finish_progress, f"框转Mask完成 ({total} 张)")
+                           finish_progress, 0, f"框转Mask完成 ({total} 张)")
         return 0
     except TaskStopRequested:
         return 130
     except Exception:
         report_task_status(task_client, args, TaskStatus.FAILED,
+                           -1,
+                           -1,
                            message=traceback.format_exc())
         return 1
     finally:
