@@ -1,21 +1,15 @@
-r""" box_to_mask.py: Generate segmentation masks from bounding box annotations
-using SAM2 with box prompts.
-
-For each image in a class directory, reads bounding boxes from boxes.json,
-feeds them as box prompts to SAM2, and saves the resulting masks.
-Multiple boxes per image are merged with logical OR.
-"""
+r"""Generate custom manifest label masks from bounding boxes using SAM2."""
 import argparse
-import json
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
-import traceback
-import torch
 import PIL.Image as Image
+import torch
+import yaml
 
 TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
@@ -69,30 +63,28 @@ def raise_if_task_stopped(client, args, progress=-1, eta_seconds=-1):
         raise TaskStopRequested()
 
 
-def find_image_file(image_dir, alias):
-    """Find an image file by alias (stem) in the image directory."""
-    for ext in ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'):
-        path = os.path.join(image_dir, alias + ext)
-        if os.path.exists(path):
-            return path
-    return None
+def load_manifest(path):
+    manifest_path = Path(path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"manifest not found: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = yaml.safe_load(handle) or {}
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest is not a mapping: {manifest_path}")
+    images = manifest.get("images", [])
+    if not isinstance(images, list):
+        raise ValueError(f"manifest images is not a list: {manifest_path}")
+    return manifest
 
 
-def load_boxes(support_dir):
-    """Load bounding boxes from boxes.json. Returns dict {alias: [box_xywh, ...]}."""
-    boxes_path = os.path.join(support_dir, 'boxes.json')
-    if not os.path.exists(boxes_path):
-        raise FileNotFoundError(f'boxes.json not found in {support_dir}')
-    with open(boxes_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    if not data:
-        print(f'Warning: boxes.json is empty in {support_dir}')
-    return data
+def save_manifest(path, manifest):
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(manifest, handle, allow_unicode=True, sort_keys=False)
 
 
 def setup_sam2_predictor(checkpoint_path, model_cfg, device):
-    """Load SAM2 base model and wrap with SAM2ImagePredictor."""
-    # Add facebookresearch sam2 to path
     sam2_root = Path(__file__).resolve().parents[2] / "facebookresearch" / "sam2"
     if str(sam2_root) not in sys.path:
         sys.path.insert(0, str(sam2_root))
@@ -100,146 +92,184 @@ def setup_sam2_predictor(checkpoint_path, model_cfg, device):
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    # Resolve config path relative to sam2 configs
-    cfg_path = os.path.join(sam2_root, 'sam2', 'configs', model_cfg)
-    if not os.path.exists(cfg_path):
-        cfg_path = model_cfg
+    cfg_path = sam2_root / "sam2" / "configs" / model_cfg
+    if not cfg_path.exists():
+        cfg_path = Path(model_cfg)
 
-    sam2_model = build_sam2(cfg_path, checkpoint_path, device=device)
-    predictor = SAM2ImagePredictor(sam2_model)
-    return predictor
+    sam2_model = build_sam2(str(cfg_path), checkpoint_path, device=device)
+    return SAM2ImagePredictor(sam2_model)
+
+
+def numeric(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def box_from_mapping(values):
+    if not isinstance(values, dict):
+        return None
+    width = numeric(values.get("width"))
+    height = numeric(values.get("height"))
+    if width <= 0 or height <= 0:
+        return None
+    x = numeric(values.get("x"))
+    y = numeric(values.get("y"))
+    return [x, y, x + width, y + height]
+
+
+def box_from_points(points):
+    if not isinstance(points, list) or len(points) < 2:
+        return None
+
+    xs = []
+    ys = []
+    for point in points:
+        if isinstance(point, dict):
+            xs.append(numeric(point.get("x")))
+            ys.append(numeric(point.get("y")))
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            xs.append(numeric(point[0]))
+            ys.append(numeric(point[1]))
+    if not xs or not ys:
+        return None
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def label_box(label):
+    data = label.get("data", {}) if isinstance(label, dict) else {}
+    box = box_from_mapping(data) or box_from_mapping(label)
+    if box is None and isinstance(data, dict):
+        box = box_from_points(data.get("points"))
+    return box
+
+
+def clamp_box(box, image_size):
+    width, height = image_size
+    x1 = min(max(float(box[0]), 0.0), float(width - 1))
+    y1 = min(max(float(box[1]), 0.0), float(height - 1))
+    x2 = min(max(float(box[2]), 0.0), float(width - 1))
+    y2 = min(max(float(box[3]), 0.0), float(height - 1))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def default_mask_path(manifest_path, image, label):
+    image_id = str(image.get("id", Path(str(image.get("path", "image"))).stem)).strip() or "image"
+    label_id = str(label.get("label_id", label.get("label_class_id", "label"))).strip() or "label"
+    masks_dir = Path(manifest_path).parent / "masks"
+    return str(masks_dir / f"image_{image_id}_label_{label_id}.png")
+
+
+def collect_label_entries(manifest, manifest_path):
+    entries = []
+    for image in manifest.get("images", []):
+        if not isinstance(image, dict):
+            continue
+        image_path = str(image.get("path", "")).strip()
+        if not image_path:
+            continue
+        labels = image.get("labels", [])
+        if not isinstance(labels, list):
+            continue
+        for label in labels:
+            if not isinstance(label, dict):
+                continue
+            box = label_box(label)
+            if box is None:
+                continue
+            mask_path = str(label.get("mask_path", "")).strip()
+            if not mask_path:
+                mask_path = default_mask_path(manifest_path, image, label)
+                label["mask_path"] = mask_path
+            entries.append((image, label, image_path, mask_path, box))
+    return entries
+
+
+def generate_masks(args, manifest, task_client):
+    entries = collect_label_entries(manifest, args.manifest)
+    if not entries:
+        report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, 1, 1), 0, "无需处理的框")
+        return 0
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.set_float32_matmul_precision("high")
+
+    print(f"Loading SAM2 model: {args.sam2_checkpoint}")
+    predictor = setup_sam2_predictor(args.sam2_checkpoint, args.sam2_cfg, device)
+    print("SAM2 model loaded.")
+
+    args.dltool_eta_start_time = time.time()
+    done = 0
+    current_image_path = None
+    current_image_size = None
+
+    for image, label, image_path, mask_path, box in entries:
+        progress = task_progress(args, done, len(entries))
+        raise_if_task_stopped(task_client, args, progress, estimate_task_eta(args, done, len(entries)))
+
+        if image_path != current_image_path:
+            if not Path(image_path).is_file():
+                raise FileNotFoundError(f"image not found: {image_path}")
+            image_pil = Image.open(image_path).convert("RGB")
+            current_image_size = image_pil.size
+            predictor.set_image(np.array(image_pil))
+            current_image_path = image_path
+
+        box_xyxy = clamp_box(box, current_image_size)
+        if box_xyxy is None:
+            raise ValueError(f"invalid box for image {image.get('id', image_path)} label {label.get('label_id', '')}")
+
+        masks, ious, _ = predictor.predict(box=box_xyxy, multimask_output=True)
+        best_idx = int(np.argmax(ious))
+        mask = masks[best_idx].astype(np.uint8) * 255
+
+        output_path = Path(mask_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(mask).save(output_path)
+
+        done += 1
+        done_progress = task_progress(args, done, len(entries))
+        eta_seconds = estimate_task_eta(args, done, len(entries))
+        report_task_progress(task_client, args, done_progress, eta_seconds, f"已处理 {done}/{len(entries)}")
+        print(f"Saved label mask: {output_path}")
+
+    output_manifest = args.output_manifest or args.manifest
+    save_manifest(output_manifest, manifest)
+    report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, len(entries), len(entries)), 0,
+                       f"框转Mask完成 ({len(entries)} 个标注)")
+    return 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SAM2 Box-to-Mask')
-    parser.add_argument('--support_dir', type=str, required=True,
-                        help='Class directory with images/ and boxes.json')
-    parser.add_argument('--sam2_checkpoint', type=str, required=True,
-                        help='Path to SAM2 checkpoint')
-    parser.add_argument('--sam2_cfg', type=str, required=True,
-                        help='Path to SAM2 config YAML')
-    parser.add_argument('--img_size', type=int, default=1024,
-                        help='Image size (default 1024)')
-    parser.add_argument('--dltool_task_host', type=str, default='')
-    parser.add_argument('--dltool_task_port', type=int, default=0)
-    parser.add_argument('--dltool_task_id', type=int, default=-1)
-    parser.add_argument('--dltool_progress_base', type=int, default=0)
-    parser.add_argument('--dltool_progress_span', type=int, default=100)
+    parser = argparse.ArgumentParser(description="SAM2 box-to-mask for FS-SAM2 custom manifest")
+    parser.add_argument("--manifest", type=str, required=True, help="FS-SAM2 custom manifest YAML")
+    parser.add_argument("--output_manifest", type=str, default="", help="Updated manifest path. Defaults to overwrite.")
+    parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 checkpoint")
+    parser.add_argument("--sam2_cfg", type=str, required=True, help="Path to SAM2 config YAML")
+    parser.add_argument("--dltool_task_host", type=str, default="")
+    parser.add_argument("--dltool_task_port", type=int, default=0)
+    parser.add_argument("--dltool_task_id", type=int, default=-1)
+    parser.add_argument("--dltool_progress_base", type=int, default=0)
+    parser.add_argument("--dltool_progress_span", type=int, default=100)
     args = parser.parse_args()
 
     task_client = create_task_client(args)
-    report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base,
-                       -1, "开始 SAM2 框转Mask")
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    torch.set_float32_matmul_precision('high')
-
-    image_dir = os.path.join(args.support_dir, 'images')
-    mask_dir = os.path.join(args.support_dir, 'masks')
-    os.makedirs(mask_dir, exist_ok=True)
-
-    if not os.path.isdir(image_dir):
-        report_task_status(task_client, args, TaskStatus.FAILED,
-                           -1,
-                           -1,
-                           message=f"Images directory not found: {image_dir}")
-        return 1
-
     try:
-        raise_if_task_stopped(task_client, args, args.dltool_progress_base, -1)
-
-        # Load boxes
-        boxes_data = load_boxes(args.support_dir)
-        if not boxes_data:
-            print(f'No boxes found in {args.support_dir}, skipping.')
-            report_task_status(task_client, args, TaskStatus.FINISHED,
-                               args.dltool_progress_base + args.dltool_progress_span,
-                               0,
-                               "无需处理的框")
-            return 0
-
-        # Load SAM2 predictor
-        print(f'Loading SAM2 model: {args.sam2_checkpoint}')
-        predictor = setup_sam2_predictor(args.sam2_checkpoint, args.sam2_cfg, device)
-        print('SAM2 model loaded.')
-
-        total = len(boxes_data)
-        args.dltool_eta_start_time = time.time()
-        for idx, (alias, box_list) in enumerate(boxes_data.items()):
-            progress = task_progress(args, idx, total)
-            raise_if_task_stopped(task_client, args, progress, estimate_task_eta(args, idx, total))
-
-            # Find image file
-            img_path = find_image_file(image_dir, alias)
-            if img_path is None:
-                print(f'  Skip (no image): {alias}')
-                done_progress = task_progress(args, idx + 1, total)
-                report_task_progress(task_client, args, done_progress,
-                                     estimate_task_eta(args, idx + 1, total),
-                                     f"跳过 (无图像): {alias}")
-                continue
-
-            # Load image
-            img = Image.open(img_path).convert('RGB')
-            orig_w, orig_h = img.size
-            print(f'  Processing [{alias}]: {img.size[0]}x{img.size[1]}, {len(box_list)} box(es)')
-
-            # Resize image for SAM2
-            predictor.set_image(np.array(img))
-
-            all_masks = []
-            for box_idx, box_xywh in enumerate(box_list):
-                x, y, w, h = (box_xywh['x'], box_xywh['y'],
-                              box_xywh['width'], box_xywh['height'])
-                # Convert to XYXY
-                box_xyxy = np.array([x, y, x + w, y + h])
-
-                try:
-                    masks, ious, _ = predictor.predict(
-                        box=box_xyxy,
-                        multimask_output=True,
-                    )
-                    # Select best mask by IoU
-                    best_idx = int(np.argmax(ious))
-                    mask = masks[best_idx]
-                    all_masks.append(mask)
-                except Exception as exc:
-                    print(f'    Box {box_idx} failed: {exc}')
-                    continue
-
-            if not all_masks:
-                print(f'    No valid masks generated for {alias}, saving blank mask')
-                merged = np.zeros((orig_h, orig_w), dtype=np.uint8)
-            else:
-                # Merge all masks with logical OR and scale to original resolution
-                merged = np.logical_or.reduce(all_masks).astype(np.uint8) * 255
-
-            # Save mask
-            out_path = os.path.join(mask_dir, alias + '.png')
-            Image.fromarray(merged).save(out_path)
-
-            done_progress = task_progress(args, idx + 1, total)
-            report_task_progress(task_client, args, done_progress,
-                                 estimate_task_eta(args, idx + 1, total),
-                                 f"已处理 {idx + 1}/{total}")
-            print(f'    Saved: {out_path}')
-
-        finish_progress = task_progress(args, total, total)
-        report_task_status(task_client, args, TaskStatus.FINISHED,
-                           finish_progress, 0, f"框转Mask完成 ({total} 张)")
-        return 0
+        report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 SAM2 框转Mask")
+        manifest = load_manifest(args.manifest)
+        return generate_masks(args, manifest, task_client)
     except TaskStopRequested:
         return 130
     except Exception:
-        report_task_status(task_client, args, TaskStatus.FAILED,
-                           -1,
-                           -1,
-                           message=traceback.format_exc())
+        report_task_status(task_client, args, TaskStatus.FAILED, -1, -1, message=traceback.format_exc())
         return 1
     finally:
         if task_client is not None:
             task_client.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

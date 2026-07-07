@@ -126,7 +126,10 @@ class Logger:
         if logpath == '':
             logpath = logtime
 
-        cls.logpath = os.path.join('logs', logpath + '.log')
+        if os.path.isabs(logpath):
+            cls.logpath = logpath
+        else:
+            cls.logpath = os.path.join('logs', logpath + '.log')
         cls.benchmark = args.benchmark
         os.makedirs(cls.logpath, exist_ok=True)
 

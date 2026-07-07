@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 
 from common.logger import Logger, AverageMeter
@@ -89,6 +90,77 @@ def create_task_client(args):
     return TaskClient(args.dltool_task_host, args.dltool_task_port)
 
 
+def load_config(path):
+    with open(path, 'r', encoding='utf-8') as handle:
+        loaded = yaml.safe_load(handle)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def group(values, *keys):
+    current = values
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key, {})
+    return current if isinstance(current, dict) else {}
+
+
+def text(values, name, default=''):
+    value = values.get(name, default) if isinstance(values, dict) else default
+    return default if value is None else str(value).strip()
+
+
+def integer(values, name, default=0):
+    try:
+        return int(values.get(name, default)) if isinstance(values, dict) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def floating(values, name, default=0.0):
+    try:
+        return float(values.get(name, default)) if isinstance(values, dict) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def apply_dltool_config(args):
+    if not args.config:
+        return
+
+    config = load_config(args.config)
+    datasets = group(config, 'datasets')
+    train_dataset = group(datasets, 'train')
+    validation_dataset = group(datasets, 'validation')
+    train_manifest = text(train_dataset, 'manifest')
+    if not train_manifest:
+        raise ValueError('datasets.train.manifest is empty')
+
+    args.datapath = train_manifest
+    args.val_datapath = text(validation_dataset, 'manifest', train_manifest)
+    args.benchmark = 'custom'
+    args.exp_id = text(config, 'model_uuid', args.exp_id)
+
+    train_params = group(config, 'train_params')
+    training = group(train_params, 'training')
+    trainer = group(train_params, 'trainer')
+    network = group(train_params, 'network')
+    model = group(train_params, 'model')
+
+    args.epochs = integer(training, 'epochs', integer(trainer, 'max_epochs', args.epochs))
+    args.bsz = integer(training, 'batch_size', args.bsz)
+    args.lr = floating(training, 'learning_rate', args.lr)
+    args.weight_decay = floating(training, 'weight_decay', args.weight_decay)
+    args.img_size = integer(network, 'image_size', integer(model, 'image_size', args.img_size))
+    args.nworker = integer(training, 'num_workers', integer(model, 'num_workers', args.nworker))
+
+    log_root = text(config, 'weight_dir')
+    if log_root:
+        args.logpath = str(Path(log_root) / 'fs_sam2')
+    args.sam2_checkpoint = text(model, 'sam2_checkpoint', args.sam2_checkpoint)
+    args.sam2_cfg = text(model, 'sam2_cfg', args.sam2_cfg)
+
+
 def task_progress(args, epoch, batch_index, batch_count, training):
     phase_offset = 0.0 if training else 0.5
     phase_fraction = 0.5 * (batch_index + 1) / max(1, batch_count)
@@ -118,6 +190,17 @@ def report_task_status(client, args, status, progress, eta_seconds, message):
 def report_task_progress(client, args, progress, eta_seconds, message):
     if client is not None and utils.is_main_process():
         client.progress(args.dltool_task_id, progress, eta_seconds, message)
+
+
+def report_task_log(client, args, message):
+    if client is not None and utils.is_main_process() and message:
+        client.log(args.dltool_task_id, message)
+
+
+def metric_value(value):
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu().item())
+    return float(value)
 
 
 def raise_if_task_stopped(client, args, progress=-1):
@@ -180,6 +263,7 @@ def main():
 
     # Arguments parsing
     parser = argparse.ArgumentParser(description='FS-SAM2 Pytorch Implementation')
+    parser.add_argument('--config', type=str, default='')
     parser.add_argument('--datapath', type=str, default='../datasets/')  # CHANGE TO YOUR PATH
     parser.add_argument('--val_datapath', type=str, default='')
     parser.add_argument('--benchmark', type=str, default='pascal', choices=['pascal', 'coco', 'fss', 'custom'])
@@ -201,6 +285,7 @@ def main():
     parser.add_argument('--dltool_task_port', type=int, default=0)
     parser.add_argument('--dltool_task_id', type=int, default=-1)
     args = parser.parse_args()
+    apply_dltool_config(args)
 
     if args.logpath == '':  # if empty, autogenerate logpath from args
         args.logpath = f'{args.benchmark}/{args.exp_id}/fold{args.fold}'
@@ -318,6 +403,15 @@ def main():
             with torch.no_grad():
                 val_loss, val_miou, val_fb_iou = train(args, epoch, sam_model, dataloader_val, optimizer, scheduler,
                                                        training=False, kshot=args.kshot, task_client=task_client)  # validation
+            report_task_log(
+                task_client,
+                args,
+                "验证结果: "
+                f"Epoch {epoch + 1}/{args.epochs}, "
+                f"val_loss={metric_value(val_loss):.6f}, "
+                f"val_miou={metric_value(val_miou):.4f}, "
+                f"val_fb_iou={metric_value(val_fb_iou):.4f}",
+            )
 
             epoch_progress = min(98, int(98 * (epoch + 1) / max(1, args.epochs)))
             report_task_progress(task_client, args, epoch_progress, estimate_task_eta(args),

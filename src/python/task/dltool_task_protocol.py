@@ -113,6 +113,9 @@ class AsyncTaskClient:
     async def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "") -> None:
         await self.send(task_id, MessageType.PROGRESS, None, progress, eta_seconds, message)
 
+    async def log(self, task_id: int, message: str) -> None:
+        await self.send(task_id, MessageType.LOG, None, -1, -1, message)
+
     async def should_stop(self, *task_ids: int) -> bool:
         expected = {int(task_id) for task_id in task_ids}
         kept: list[dict[str, Any]] = []
@@ -205,6 +208,11 @@ class TaskClient:
         if self._closed:
             return
         self._submit(self._client.progress(task_id, progress, eta_seconds, message)).result(timeout=5)
+
+    def log(self, task_id: int, message: str) -> None:
+        if self._closed:
+            return
+        self._submit(self._client.log(task_id, message)).result(timeout=5)
 
     def should_stop(self, *task_ids: int) -> bool:
         if self._closed:
