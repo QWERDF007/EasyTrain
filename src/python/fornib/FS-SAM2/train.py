@@ -147,6 +147,7 @@ def apply_dltool_config(args):
     network = group(train_params, 'network')
     model = group(train_params, 'model')
 
+    args.kshot = integer(training, 'kshot', args.kshot)
     args.epochs = integer(training, 'epochs', integer(trainer, 'max_epochs', args.epochs))
     args.bsz = integer(training, 'batch_size', args.bsz)
     args.lr = floating(training, 'learning_rate', args.lr)

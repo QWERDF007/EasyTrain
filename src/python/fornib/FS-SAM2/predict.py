@@ -165,6 +165,7 @@ def apply_dltool_config(args):
     elif text(config, 'weight_dir'):
         args.checkpoint = str(Path(text(config, 'weight_dir')) / 'fs_sam2' / 'best_model.pt')
 
+    args.kshot = integer(inference, 'kshot', args.kshot)
     args.img_size = integer(inference, 'image_size', integer(model, 'image_size', args.img_size))
     args.sam2_checkpoint = text(model, 'sam2_checkpoint', args.sam2_checkpoint)
     args.sam2_cfg = text(model, 'sam2_cfg', args.sam2_cfg)

@@ -84,6 +84,46 @@ def save_manifest(path, manifest):
         yaml.safe_dump(manifest, handle, allow_unicode=True, sort_keys=False)
 
 
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def group(values, *keys):
+    current = values
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key, {})
+    return current if isinstance(current, dict) else {}
+
+
+def text(values, name, default=""):
+    value = values.get(name, default) if isinstance(values, dict) else default
+    return default if value is None else str(value).strip()
+
+
+def apply_dltool_config(args):
+    if not args.config:
+        return []
+
+    config = load_config(args.config)
+    datasets = group(config, "datasets")
+    manifests = []
+    for split_name in ("train", "validation"):
+        manifest = text(group(datasets, split_name), "manifest")
+        if manifest:
+            manifests.append(manifest)
+    if not manifests:
+        raise ValueError("datasets.train.manifest is empty")
+
+    model = group(config, "train_params", "model")
+    args.sam2_checkpoint = text(model, "sam2_checkpoint", args.sam2_checkpoint)
+    args.sam2_cfg = text(model, "sam2_cfg", args.sam2_cfg)
+    return manifests
+
+
 def setup_sam2_predictor(checkpoint_path, model_cfg, device):
     sam2_root = Path(__file__).resolve().parents[2] / "facebookresearch" / "sam2"
     if str(sam2_root) not in sys.path:
@@ -188,10 +228,13 @@ def collect_label_entries(manifest, manifest_path):
     return entries
 
 
-def generate_masks(args, manifest, task_client):
+def generate_masks(args, manifest, task_client, finish_on_complete=True):
     entries = collect_label_entries(manifest, args.manifest)
     if not entries:
-        report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, 1, 1), 0, "无需处理的框")
+        if finish_on_complete:
+            report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, 1, 1), 0, "无需处理的框")
+        else:
+            report_task_progress(task_client, args, task_progress(args, 1, 1), 0, "无需处理的框")
         return 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -238,17 +281,22 @@ def generate_masks(args, manifest, task_client):
 
     output_manifest = args.output_manifest or args.manifest
     save_manifest(output_manifest, manifest)
-    report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, len(entries), len(entries)), 0,
-                       f"框转Mask完成 ({len(entries)} 个标注)")
+    if finish_on_complete:
+        report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, len(entries), len(entries)), 0,
+                           f"框转Mask完成 ({len(entries)} 个标注)")
+    else:
+        report_task_progress(task_client, args, task_progress(args, len(entries), len(entries)), 0,
+                             f"框转Mask完成 ({len(entries)} 个标注)")
     return 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="SAM2 box-to-mask for FS-SAM2 custom manifest")
-    parser.add_argument("--manifest", type=str, required=True, help="FS-SAM2 custom manifest YAML")
+    parser.add_argument("--config", type=str, default="", help="DLTool task config YAML")
+    parser.add_argument("--manifest", type=str, default="", help="FS-SAM2 custom manifest YAML")
     parser.add_argument("--output_manifest", type=str, default="", help="Updated manifest path. Defaults to overwrite.")
-    parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 checkpoint")
-    parser.add_argument("--sam2_cfg", type=str, required=True, help="Path to SAM2 config YAML")
+    parser.add_argument("--sam2_checkpoint", type=str, default="", help="Path to SAM2 checkpoint")
+    parser.add_argument("--sam2_cfg", type=str, default="", help="Path to SAM2 config YAML")
     parser.add_argument("--dltool_task_host", type=str, default="")
     parser.add_argument("--dltool_task_port", type=int, default=0)
     parser.add_argument("--dltool_task_id", type=int, default=-1)
@@ -259,8 +307,28 @@ def main():
     task_client = create_task_client(args)
     try:
         report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 SAM2 框转Mask")
-        manifest = load_manifest(args.manifest)
-        return generate_masks(args, manifest, task_client)
+        manifests = apply_dltool_config(args)
+        if not manifests:
+            if not args.manifest:
+                raise ValueError("manifest is empty")
+            manifests = [args.manifest]
+        if not args.sam2_checkpoint:
+            raise ValueError("sam2_checkpoint is empty")
+        if not args.sam2_cfg:
+            raise ValueError("sam2_cfg is empty")
+
+        original_base = args.dltool_progress_base
+        original_span = args.dltool_progress_span
+        for index, manifest_path in enumerate(manifests):
+            split_base = original_base + original_span * index // max(1, len(manifests))
+            split_end = original_base + original_span * (index + 1) // max(1, len(manifests))
+            args.dltool_progress_base = split_base
+            args.dltool_progress_span = max(1, split_end - split_base)
+            args.manifest = manifest_path
+            args.output_manifest = manifest_path
+            manifest = load_manifest(args.manifest)
+            generate_masks(args, manifest, task_client, finish_on_complete=index == len(manifests) - 1)
+        return 0
     except TaskStopRequested:
         return 130
     except Exception:
