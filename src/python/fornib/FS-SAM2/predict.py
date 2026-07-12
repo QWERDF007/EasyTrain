@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-import traceback
+
 import torch
 import torch.nn.functional as F
 import PIL.Image as Image
@@ -19,17 +19,14 @@ TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
     sys.path.insert(0, str(TASK_DIR))
 
-from dltool_task_protocol import TaskClient, TaskStatus
-
-
-class TaskStopRequested(Exception):
-    pass
-
-
-def create_task_client(args):
-    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
-        return None
-    return TaskClient(args.dltool_task_host, args.dltool_task_port)
+from dltool_task_protocol import TaskStatus
+from dltool_task_reporting import (
+    TaskStopRequested,
+    create_task_client,
+    report_failure,
+    report_progress as report_task_progress,
+    report_status as report_task_status,
+)
 
 
 def task_progress(args, done, total):
@@ -51,14 +48,6 @@ def estimate_task_eta(args, done, total):
     return int(round(elapsed * remaining_span / completed_span))
 
 
-def report_task_status(client, args, status, progress, eta_seconds, message):
-    if client is not None:
-        client.status(args.dltool_task_id, status, progress, eta_seconds, message)
-
-
-def report_task_progress(client, args, progress, eta_seconds, message):
-    if client is not None:
-        client.progress(args.dltool_task_id, progress, eta_seconds, message)
 
 
 def raise_if_task_stopped(client, args, progress=-1, eta_seconds=-1):
@@ -473,7 +462,7 @@ def main():
     except TaskStopRequested:
         return 130
     except Exception:
-        report_task_status(task_client, args, TaskStatus.FAILED, -1, -1, traceback.format_exc())
+        report_failure(task_client, args, "推理")
         return 1
     finally:
         if task_client is not None:

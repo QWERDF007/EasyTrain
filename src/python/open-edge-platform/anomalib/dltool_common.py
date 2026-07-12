@@ -14,10 +14,15 @@ for path in (SRC_DIR, TASK_DIR):
         sys.path.insert(0, str(path))
 
 from dltool_task_protocol import TaskClient, TaskStatus  # noqa: E402
-
-
-class TaskStopRequested(Exception):
-    pass
+from dltool_task_reporting import (  # noqa: E402
+    TaskStopRequested,
+    create_task_client,
+    report_failure,
+    report_log as log,
+    report_progress as progress,
+    report_result,
+    report_status as status,
+)
 
 
 def add_task_arguments(parser: argparse.ArgumentParser) -> None:
@@ -95,25 +100,6 @@ def square_size(values: dict[str, Any], name: str, default: int) -> tuple[int, i
     return size, size
 
 
-def create_task_client(args: argparse.Namespace) -> TaskClient | None:
-    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
-        return None
-    return TaskClient(args.dltool_task_host, args.dltool_task_port)
-
-
-def status(client: TaskClient | None, task_id: int, task_status: TaskStatus, progress: int, eta: int, message: str) -> None:
-    if client is not None:
-        client.status(task_id, task_status, progress, eta, message)
-
-
-def progress(client: TaskClient | None, task_id: int, value: int, eta: int, message: str) -> None:
-    if client is not None:
-        client.progress(task_id, value, eta, message)
-
-
-def log(client: TaskClient | None, task_id: int, message: str) -> None:
-    if client is not None and message:
-        client.log(task_id, message)
 
 
 def should_stop(client: TaskClient | None, task_id: int) -> bool:

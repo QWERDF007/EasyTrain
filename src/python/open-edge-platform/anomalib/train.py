@@ -1,8 +1,6 @@
 import argparse
-import json
-import traceback
 
-from lightning.pytorch import seed_everything
+
 
 from dltool_common import (
     DltoolProgressCallback,
@@ -16,7 +14,8 @@ from dltool_common import (
     group,
     integer,
     load_config,
-    log,
+    report_failure,
+    report_result,
     status,
 )
 
@@ -28,6 +27,8 @@ def main() -> int:
 
     client = create_task_client(args)
     try:
+        from lightning.pytorch import seed_everything
+
         config = load_config(args.config)
         seed = integer(group(config, "train_params", "trainer"), "seed", 42)
         seed_everything(seed, workers=True)
@@ -44,13 +45,13 @@ def main() -> int:
         best_model_path = engine.best_model_path or ""
         message = f"训练完成: {best_model_path}" if best_model_path else "训练完成"
         if results:
-            log(client, args.dltool_task_id, "验证评估: " + json.dumps(results, ensure_ascii=False, default=str))
+            report_result(client, args, "验证评估", results)
         status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, message)
         return 0
     except TaskStopRequested:
         return 2
     except Exception:
-        status(client, args.dltool_task_id, TaskStatus.FAILED, -1, -1, traceback.format_exc())
+        report_failure(client, args, "训练")
         return 1
     finally:
         if client is not None:

@@ -3,7 +3,7 @@ import os
 import argparse
 import sys
 import time
-import traceback
+
 from pathlib import Path
 
 import torch
@@ -21,11 +21,16 @@ TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
     sys.path.insert(0, str(TASK_DIR))
 
-from dltool_task_protocol import TaskClient, TaskStatus
-
-
-class TaskStopRequested(Exception):
-    pass
+from dltool_task_protocol import TaskStatus
+from dltool_task_reporting import (
+    TaskStopRequested,
+    create_task_client,
+    report_failure,
+    report_log as report_task_log,
+    report_progress as report_task_progress,
+    report_result,
+    report_status as report_task_status,
+)
 
 
 def build_custom_dataloader(args, datapath, training):
@@ -84,10 +89,6 @@ def build_train_val_dataloaders(args):
     return dataloader_trn, dataloader_val
 
 
-def create_task_client(args):
-    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
-        return None
-    return TaskClient(args.dltool_task_host, args.dltool_task_port)
 
 
 def load_config(path):
@@ -183,19 +184,6 @@ def estimate_task_eta(args):
     return int(round(elapsed * remaining_steps / completed_steps))
 
 
-def report_task_status(client, args, status, progress, eta_seconds, message):
-    if client is not None and utils.is_main_process():
-        client.status(args.dltool_task_id, status, progress, eta_seconds, message)
-
-
-def report_task_progress(client, args, progress, eta_seconds, message):
-    if client is not None and utils.is_main_process():
-        client.progress(args.dltool_task_id, progress, eta_seconds, message)
-
-
-def report_task_log(client, args, message):
-    if client is not None and utils.is_main_process() and message:
-        client.log(args.dltool_task_id, message)
 
 
 def metric_value(value):
@@ -404,14 +392,16 @@ def main():
             with torch.no_grad():
                 val_loss, val_miou, val_fb_iou = train(args, epoch, sam_model, dataloader_val, optimizer, scheduler,
                                                        training=False, kshot=args.kshot, task_client=task_client)  # validation
-            report_task_log(
+            report_result(
                 task_client,
                 args,
-                "验证结果: "
-                f"Epoch {epoch + 1}/{args.epochs}, "
-                f"val_loss={metric_value(val_loss):.6f}, "
-                f"val_miou={metric_value(val_miou):.4f}, "
-                f"val_fb_iou={metric_value(val_fb_iou):.4f}",
+                "验证结果",
+                {
+                    "epoch": f"{epoch + 1}/{args.epochs}",
+                    "val_loss": f"{metric_value(val_loss):.6f}",
+                    "val_miou": f"{metric_value(val_miou):.4f}",
+                    "val_fb_iou": f"{metric_value(val_fb_iou):.4f}",
+                },
             )
 
             epoch_progress = min(98, int(98 * (epoch + 1) / max(1, args.epochs)))
@@ -433,7 +423,7 @@ def main():
             task_client.close()
         return 130
     except Exception:
-        report_task_status(task_client, args, TaskStatus.FAILED, -1, -1, traceback.format_exc())
+        report_failure(task_client, args, "训练")
         if task_client is not None:
             task_client.close()
         return 1

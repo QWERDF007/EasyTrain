@@ -1,6 +1,6 @@
 import argparse
-import json
-import traceback
+
+
 
 from dltool_common import (
     DltoolProgressCallback,
@@ -13,7 +13,8 @@ from dltool_common import (
     create_task_client,
     group,
     load_config,
-    log,
+    report_failure,
+    report_result,
     status,
     text,
 )
@@ -41,13 +42,13 @@ def main() -> int:
         results = engine.test(model=model, datamodule=datamodule, ckpt_path=checkpoint_path)
 
         if results:
-            log(client, args.dltool_task_id, "测试评估: " + json.dumps(results, ensure_ascii=False, default=str))
+            report_result(client, args, "测试评估", results)
         status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, "测试完成")
         return 0
     except TaskStopRequested:
         return 2
     except Exception:
-        status(client, args.dltool_task_id, TaskStatus.FAILED, -1, -1, traceback.format_exc())
+        report_failure(client, args, "测试")
         return 1
     finally:
         if client is not None:
