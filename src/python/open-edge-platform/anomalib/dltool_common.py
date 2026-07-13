@@ -313,10 +313,14 @@ def build_model(config: dict[str, Any], section: str = "train_params"):
 
 def build_engine(config: dict[str, Any], section: str, callback):
     from anomalib.engine import Engine
+    from anomalib.loggers import AnomalibTensorBoardLogger
 
     trainer = group(config, section, "trainer") or group(config, section, "inference")
+    log_dir = text(config, "log_dir", "logs")
+    tensorboard_logger = AnomalibTensorBoardLogger(save_dir=log_dir, name="", version="")
     kwargs: dict[str, Any] = {
         "callbacks": [callback],
+        "logger": tensorboard_logger,
         "default_root_dir": text(trainer, "output_dir", "results"),
         "accelerator": text(trainer, "accelerator", "auto"),
         "devices": integer(trainer, "devices", 1),
