@@ -1,4 +1,5 @@
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -98,6 +99,21 @@ def string_list(values: dict[str, Any], name: str, default: list[str] | None = N
 def square_size(values: dict[str, Any], name: str, default: int) -> tuple[int, int]:
     size = integer(values, name, default)
     return size, size
+
+
+def batch_count(value: Any) -> int:
+    if isinstance(value, (list, tuple)):
+        total = 0
+        for item in value:
+            try:
+                total += max(0, int(item))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return total
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 
@@ -294,10 +310,20 @@ def build_model(config: dict[str, Any], section: str = "train_params"):
 
     if architecture == "dinomaly2":
         from anomalib.models import Dinomaly
+        from anomalib.metrics import AUPRO, Evaluator
 
         pre_processor = Dinomaly.configure_pre_processor(
             image_size=square_size(model_params, "image_size", 448),
             crop_size=integer(model_params, "crop_size", 392),
+        )
+        default_evaluator = Dinomaly.configure_evaluator()
+        evaluator = Evaluator(
+            val_metrics=list(default_evaluator.val_metrics),
+            test_metrics=[
+                *list(default_evaluator.test_metrics),
+                AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_", strict=False),
+            ],
+            compute_on_cpu=default_evaluator.compute_on_cpu,
         )
         return Dinomaly(
             encoder_name=text(model_params, "encoder_name", "dinov2reg_vit_base_14"),
@@ -306,6 +332,7 @@ def build_model(config: dict[str, Any], section: str = "train_params"):
             use_context_recentering=boolean(model_params, "use_context_recentering", True),
             precision=text(model_params, "precision", "float32"),
             pre_processor=pre_processor,
+            evaluator=evaluator,
         )
 
     raise ValueError(f"Unsupported anomalib architecture: {architecture}")
@@ -336,6 +363,10 @@ def build_engine(config: dict[str, Any], section: str, callback):
 
 
 class DltoolProgressCallback:
+    REPORT_INTERVAL_SECONDS = 0.0
+    FIT_PROGRESS_END = 90
+    TEST_PROGRESS_END = 98
+
     def __init__(self, client: TaskClient | None, task_id: int, label: str):
         from lightning.pytorch.callbacks import Callback
 
@@ -344,65 +375,201 @@ class DltoolProgressCallback:
                 super().__init__()
                 self.outer = outer
 
-            def on_train_start(self, trainer, pl_module):
+            def on_fit_start(self, trainer, pl_module):
+                self.outer.configure_fit(trainer)
+                self.outer.report_runtime(trainer, "训练")
                 self.outer.report_status("开始训练")
 
             def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
                 self.outer.check_stop()
 
             def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-                total = max(1, int(getattr(trainer, "estimated_stepping_batches", 1) or 1))
                 done = max(0, int(getattr(trainer, "global_step", 0)))
-                self.outer.update(done, total, "训练中")
+                self.outer.update_fit(done, "训练中")
 
             def on_validation_start(self, trainer, pl_module):
-                self.outer.validation_base = self.outer.completed
                 self.outer.report_status("开始验证")
 
             def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
                 self.outer.check_stop()
 
             def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-                batches = getattr(trainer, "num_val_batches", [1]) or [1]
-                total = max(1, int(batches[0] or 1))
-                self.outer.update(self.outer.validation_base + batch_idx + 1, self.outer.validation_base + total, "验证中")
+                self.outer.validation_done += 1
+                train_done = max(0, int(getattr(trainer, "global_step", 0)))
+                self.outer.update_fit(train_done, "验证中")
 
             def on_test_start(self, trainer, pl_module):
+                self.outer.configure_test(trainer)
+                self.outer.report_runtime(trainer, "测试")
                 self.outer.report_status("开始测试")
 
             def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
                 self.outer.check_stop()
 
             def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-                total = max(1, int(getattr(trainer, "num_test_batches", [1])[0] or 1))
-                self.outer.update(batch_idx + 1, total, "测试中")
+                self.outer.test_done += 1
+                self.outer.update_test(self.outer.test_done, "测试中")
+
+            def on_test_end(self, trainer, pl_module):
+                self.outer.update_test(self.outer.test_total, "测试完成", force=True)
+                self.outer.report_summary("测试")
 
             def on_predict_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
                 self.outer.check_stop()
 
+            def on_predict_start(self, trainer, pl_module):
+                self.outer.configure_predict(trainer)
+                self.outer.report_runtime(trainer, "预测")
+                self.outer.report_status("开始预测")
+
             def on_predict_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-                total = max(1, int(getattr(trainer, "num_predict_batches", [1])[0] or 1))
-                self.outer.update(batch_idx + 1, total, "预测中")
+                self.outer.predict_done += 1
+                self.outer.update_predict(self.outer.predict_done, "预测中")
+
+            def on_predict_end(self, trainer, pl_module):
+                self.outer.update_predict(self.outer.predict_total, "预测完成", force=True)
+                self.outer.report_summary("预测")
 
         self.client = client
         self.task_id = task_id
         self.label = label
-        self.start_time = time.time()
-        self.completed = 0
-        self.validation_base = 0
+        self.start_time = time.monotonic()
+        self.phase_start_time = self.start_time
         self.current_progress = 0
+        self.train_total = 1
+        self.validation_total = 0
+        self.validation_done = 0
+        self.fit_total = 1
+        self.test_total = 1
+        self.test_done = 0
+        self.predict_total = 1
+        self.predict_done = 0
+        self.last_report_time = 0.0
+        self.last_report_message = ""
+        self.report_count = 0
         self.callback = CallbackImpl(self)
 
-    def update(self, done: int, total: int, message: str) -> None:
-        done = max(self.completed, done)
-        self.completed = done
-        value = min(98, max(0, int(98 * done / max(1, total))))
+    def configure_fit(self, trainer) -> None:
+        self.train_total = max(1, batch_count(getattr(trainer, "estimated_stepping_batches", 1)))
+        train_batches = max(1, batch_count(getattr(trainer, "num_training_batches", 1)))
+        accumulation = batch_count(getattr(trainer, "accumulate_grad_batches", 1)) or 1
+        steps_per_epoch = max(1, math.ceil(train_batches / accumulation))
+        estimated_epochs = max(1, math.ceil(self.train_total / steps_per_epoch))
+        validation_batches = batch_count(getattr(trainer, "num_val_batches", 0))
+        check_every = getattr(trainer, "check_val_every_n_epoch", 1)
+        if isinstance(check_every, int) and check_every > 0:
+            validation_runs = math.ceil(estimated_epochs / check_every)
+        else:
+            validation_runs = estimated_epochs
+        self.validation_total = validation_batches * validation_runs
+        self.validation_done = 0
+        self.fit_total = max(1, self.train_total + self.validation_total)
+        self.phase_start_time = time.monotonic()
+
+    def configure_test(self, trainer) -> None:
+        self.test_total = max(1, batch_count(getattr(trainer, "num_test_batches", 1)))
+        self.test_done = 0
+        self.phase_start_time = time.monotonic()
+
+    def configure_predict(self, trainer) -> None:
+        self.predict_total = max(1, batch_count(getattr(trainer, "num_predict_batches", 1)))
+        self.predict_done = 0
+        self.phase_start_time = time.monotonic()
+
+    def report_runtime(self, trainer, phase: str) -> None:
+        try:
+            import torch
+
+            cuda_available = bool(torch.cuda.is_available())
+            gpu_count = int(torch.cuda.device_count()) if cuda_available else 0
+            gpu_name = torch.cuda.get_device_name(0) if gpu_count else "无"
+        except Exception as exc:
+            cuda_available = False
+            gpu_count = 0
+            gpu_name = f"查询失败: {exc}"
+
+        strategy = getattr(trainer, "strategy", None)
+        root_device = getattr(strategy, "root_device", "未知")
+        datamodule = getattr(trainer, "datamodule", None)
+        workers = getattr(datamodule, "num_workers", "未知")
+        train_batch_size = getattr(datamodule, "train_batch_size", "未知")
+        eval_batch_size = getattr(datamodule, "eval_batch_size", "未知")
+        report_interval = (
+            "每个batch"
+            if self.REPORT_INTERVAL_SECONDS <= 0
+            else f"{self.REPORT_INTERVAL_SECONDS:.1f}秒"
+        )
+        log(
+            self.client,
+            self.task_id,
+            f"{self.label}: {phase}设备={root_device}, CUDA可用={cuda_available}, "
+            f"GPU数量={gpu_count}, GPU={gpu_name}, 加载线程={workers}, "
+            f"训练批量={train_batch_size}, 评估批量={eval_batch_size}, "
+            f"进度上报间隔={report_interval}（每个batch检查停止）",
+        )
+        if phase == "训练":
+            log(
+                self.client,
+                self.task_id,
+                f"{self.label}: 训练步数={self.train_total}, 预计验证批次={self.validation_total}, "
+                f"总工作量={self.fit_total}；训练阶段最多报告{self.FIT_PROGRESS_END}%",
+            )
+
+    def update_fit(self, train_done: int, message: str) -> None:
+        done = max(0, min(self.train_total, int(train_done))) + min(self.validation_done, self.validation_total)
+        self.update(done, self.fit_total, message, 0, self.FIT_PROGRESS_END)
+
+    def update_test(self, done: int, message: str, force: bool = False) -> None:
+        self.update(done, self.test_total, message, self.FIT_PROGRESS_END, self.TEST_PROGRESS_END, force)
+
+    def update_predict(self, done: int, message: str, force: bool = False) -> None:
+        self.update(done, self.predict_total, message, 0, self.TEST_PROGRESS_END, force)
+
+    def report_summary(self, phase: str) -> None:
+        report_interval = (
+            "每个batch"
+            if self.REPORT_INTERVAL_SECONDS <= 0
+            else f"{self.REPORT_INTERVAL_SECONDS:.1f}秒"
+        )
+        log(
+            self.client,
+            self.task_id,
+            f"{self.label}: {phase}阶段进度上报完成，实际发送{self.report_count}次，"
+            f"间隔规则为{report_interval}或阶段切换/完成时立即发送",
+        )
+
+    def update(
+        self,
+        done: int,
+        total: int,
+        message: str,
+        progress_start: int,
+        progress_end: int,
+        force: bool = False,
+    ) -> None:
+        total = max(1, int(total))
+        done = max(0, min(total, int(done)))
+        value = progress_start + int((progress_end - progress_start) * done / total)
+        value = min(progress_end, max(progress_start, value))
         self.current_progress = max(self.current_progress, value)
         eta = -1
-        elapsed = time.time() - self.start_time
+        elapsed = time.monotonic() - self.phase_start_time
         if done > 0 and elapsed > 0 and total > done:
             eta = int(round(elapsed * (total - done) / done))
-        progress(self.client, self.task_id, self.current_progress, eta, message)
+        now = time.monotonic()
+        should_report = (
+            force
+            or self.last_report_time <= 0
+            or self.REPORT_INTERVAL_SECONDS <= 0
+            or now - self.last_report_time >= self.REPORT_INTERVAL_SECONDS
+            or message != self.last_report_message
+            or done >= total
+        )
+        if should_report:
+            progress(self.client, self.task_id, self.current_progress, eta, message)
+            self.last_report_time = now
+            self.last_report_message = message
+            self.report_count += 1
         self.check_stop()
 
     def report_status(self, message: str) -> None:
