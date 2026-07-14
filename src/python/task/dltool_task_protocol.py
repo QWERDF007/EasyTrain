@@ -107,11 +107,12 @@ class AsyncTaskClient:
                 await self._writer.drain()
 
     async def status(self, task_id: int, status: TaskStatus, progress: int, eta_seconds: int,
-                     message: str = "") -> None:
-        await self.send(task_id, MessageType.STATUS, status, progress, eta_seconds, message)
+                     message: str = "", **payload: Any) -> None:
+        await self.send(task_id, MessageType.STATUS, status, progress, eta_seconds, message, **payload)
 
-    async def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "") -> None:
-        await self.send(task_id, MessageType.PROGRESS, None, progress, eta_seconds, message)
+    async def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "",
+                       **payload: Any) -> None:
+        await self.send(task_id, MessageType.PROGRESS, None, progress, eta_seconds, message, **payload)
 
     async def log(self, task_id: int, message: str) -> None:
         await self.send(task_id, MessageType.LOG, None, -1, -1, message)
@@ -199,15 +200,16 @@ class TaskClient:
         self._submit(self._client.send(task_id, msg_type, status, progress, eta_seconds, message,
                                        **payload)).result(timeout=5)
 
-    def status(self, task_id: int, status: TaskStatus, progress: int, eta_seconds: int, message: str = "") -> None:
+    def status(self, task_id: int, status: TaskStatus, progress: int, eta_seconds: int, message: str = "",
+               **payload: Any) -> None:
         if self._closed:
             return
-        self._submit(self._client.status(task_id, status, progress, eta_seconds, message)).result(timeout=5)
+        self._submit(self._client.status(task_id, status, progress, eta_seconds, message, **payload)).result(timeout=5)
 
-    def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "") -> None:
+    def progress(self, task_id: int, progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
         if self._closed:
             return
-        self._submit(self._client.progress(task_id, progress, eta_seconds, message)).result(timeout=5)
+        self._submit(self._client.progress(task_id, progress, eta_seconds, message, **payload)).result(timeout=5)
 
     def log(self, task_id: int, message: str) -> None:
         if self._closed:

@@ -29,15 +29,15 @@ def create_task_client(args: Namespace) -> TaskClient | None:
 
 
 def report_status(client: TaskClient | None, task: Namespace | int, status: TaskStatus,
-                  progress: int, eta_seconds: int, message: str = "") -> None:
+                  progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
     if client is not None:
-        client.status(task_id(task), status, progress, eta_seconds, message)
+        client.status(task_id(task), status, progress, eta_seconds, message, **payload)
 
 
 def report_progress(client: TaskClient | None, task: Namespace | int, progress: int,
-                    eta_seconds: int, message: str = "") -> None:
+                    eta_seconds: int, message: str = "", **payload: Any) -> None:
     if client is not None:
-        client.progress(task_id(task), progress, eta_seconds, message)
+        client.progress(task_id(task), progress, eta_seconds, message, **payload)
 
 
 def report_log(client: TaskClient | None, task: Namespace | int, message: str) -> None:

@@ -12,6 +12,7 @@ from dltool_common import (
     group,
     integer,
     load_config,
+    metrics_text,
     report_failure,
     report_result,
     status,
@@ -42,9 +43,11 @@ def main() -> int:
 
         best_model_path = engine.best_model_path or ""
         message = f"训练完成: {best_model_path}" if best_model_path else "训练完成"
+        final_payload = {"phase": "test", "started": True, "phase_progress": 100}
         if results:
             report_result(client, args, "验证评估", results)
-        status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, message)
+            final_payload["metrics"] = metrics_text(results)
+        status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, message, **final_payload)
         return 0
     except TaskStopRequested:
         return 2

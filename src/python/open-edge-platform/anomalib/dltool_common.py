@@ -362,6 +362,62 @@ def build_engine(config: dict[str, Any], section: str, callback):
     return Engine(**kwargs)
 
 
+def metric_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [metric_value(item) for item in value]
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "item"):
+            value = value.item()
+    except Exception:
+        pass
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def metrics_payload(results: Any) -> dict[str, Any]:
+    if isinstance(results, list):
+        merged: dict[str, Any] = {}
+        for result in results:
+            normalized = metric_value(result)
+            if isinstance(normalized, dict):
+                merged.update(normalized)
+        return merged
+    normalized = metric_value(results)
+    return normalized if isinstance(normalized, dict) else {"value": normalized}
+
+
+def metrics_text(results: Any) -> str:
+    values = metrics_payload(results)
+    return "\n".join(f"{key}: {value}" for key, value in values.items())
+
+
+def status_value_text(value: Any, digits: int = 6) -> str:
+    normalized = metric_value(value)
+    if normalized is None:
+        return "-"
+    if isinstance(normalized, float):
+        return f"{normalized:.{digits}f}"
+    return str(normalized)
+
+
+def elapsed_text(seconds: Any) -> str:
+    try:
+        total = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError, OverflowError):
+        return "-"
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 class DltoolProgressCallback:
     REPORT_INTERVAL_SECONDS = 0.0
     FIT_PROGRESS_END = 90
@@ -378,17 +434,17 @@ class DltoolProgressCallback:
             def on_fit_start(self, trainer, pl_module):
                 self.outer.configure_fit(trainer)
                 self.outer.report_runtime(trainer, "训练")
-                self.outer.report_status("开始训练")
+                self.outer.report_status("开始训练", phase="train", started=True, phase_progress=0)
 
             def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
                 self.outer.check_stop()
 
             def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
                 done = max(0, int(getattr(trainer, "global_step", 0)))
-                self.outer.update_fit(done, "训练中")
+                self.outer.update_fit(trainer, done, outputs, "训练中", batch_idx=batch_idx)
 
             def on_validation_start(self, trainer, pl_module):
-                self.outer.report_status("开始验证")
+                self.outer.report_status("开始验证", phase="train", started=True)
 
             def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
                 self.outer.check_stop()
@@ -396,22 +452,25 @@ class DltoolProgressCallback:
             def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
                 self.outer.validation_done += 1
                 train_done = max(0, int(getattr(trainer, "global_step", 0)))
-                self.outer.update_fit(train_done, "验证中")
+                self.outer.update_fit(trainer, train_done, outputs, "验证中")
+
+            def on_fit_end(self, trainer, pl_module):
+                self.outer.update_fit(trainer, self.outer.train_total, None, "训练完成", force=True)
 
             def on_test_start(self, trainer, pl_module):
                 self.outer.configure_test(trainer)
                 self.outer.report_runtime(trainer, "测试")
-                self.outer.report_status("开始测试")
+                self.outer.report_status("开始测试", phase="test", started=True, phase_progress=0)
 
             def on_test_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
                 self.outer.check_stop()
 
             def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
                 self.outer.test_done += 1
-                self.outer.update_test(self.outer.test_done, "测试中")
+                self.outer.update_test(trainer, self.outer.test_done, "测试中")
 
             def on_test_end(self, trainer, pl_module):
-                self.outer.update_test(self.outer.test_total, "测试完成", force=True)
+                self.outer.update_test(trainer, self.outer.test_total, "测试完成", force=True)
                 self.outer.report_summary("测试")
 
             def on_predict_batch_start(self, trainer, pl_module, batch, batch_idx, dataloader_idx=0):
@@ -420,14 +479,14 @@ class DltoolProgressCallback:
             def on_predict_start(self, trainer, pl_module):
                 self.outer.configure_predict(trainer)
                 self.outer.report_runtime(trainer, "预测")
-                self.outer.report_status("开始预测")
+                self.outer.report_status("开始预测", phase="test", started=True, phase_progress=0)
 
             def on_predict_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
                 self.outer.predict_done += 1
-                self.outer.update_predict(self.outer.predict_done, "预测中")
+                self.outer.update_predict(trainer, self.outer.predict_done, "预测中")
 
             def on_predict_end(self, trainer, pl_module):
-                self.outer.update_predict(self.outer.predict_total, "预测完成", force=True)
+                self.outer.update_predict(trainer, self.outer.predict_total, "预测完成", force=True)
                 self.outer.report_summary("预测")
 
         self.client = client
@@ -440,6 +499,14 @@ class DltoolProgressCallback:
         self.validation_total = 0
         self.validation_done = 0
         self.fit_total = 1
+        self.epoch_total = 1
+        self.train_batches_per_epoch = 1
+        self.iter_total = 1
+        self.last_epoch_current = 0
+        self.last_iter_current = 0
+        self.last_phase_progress = 0
+        self.last_lr = None
+        self.last_loss = None
         self.test_total = 1
         self.test_done = 0
         self.predict_total = 1
@@ -447,14 +514,18 @@ class DltoolProgressCallback:
         self.last_report_time = 0.0
         self.last_report_message = ""
         self.report_count = 0
+        self.fit_start_time = self.start_time
         self.callback = CallbackImpl(self)
 
     def configure_fit(self, trainer) -> None:
         self.train_total = max(1, batch_count(getattr(trainer, "estimated_stepping_batches", 1)))
         train_batches = max(1, batch_count(getattr(trainer, "num_training_batches", 1)))
+        self.train_batches_per_epoch = train_batches
         accumulation = batch_count(getattr(trainer, "accumulate_grad_batches", 1)) or 1
         steps_per_epoch = max(1, math.ceil(train_batches / accumulation))
         estimated_epochs = max(1, math.ceil(self.train_total / steps_per_epoch))
+        self.epoch_total = estimated_epochs
+        self.iter_total = max(1, estimated_epochs * train_batches)
         validation_batches = batch_count(getattr(trainer, "num_val_batches", 0))
         check_every = getattr(trainer, "check_val_every_n_epoch", 1)
         if isinstance(check_every, int) and check_every > 0:
@@ -464,7 +535,11 @@ class DltoolProgressCallback:
         self.validation_total = validation_batches * validation_runs
         self.validation_done = 0
         self.fit_total = max(1, self.train_total + self.validation_total)
-        self.phase_start_time = time.monotonic()
+        self.fit_start_time = time.monotonic()
+        self.phase_start_time = self.fit_start_time
+        self.last_epoch_current = 0
+        self.last_iter_current = 0
+        self.last_phase_progress = 0
 
     def configure_test(self, trainer) -> None:
         self.test_total = max(1, batch_count(getattr(trainer, "num_test_batches", 1)))
@@ -515,15 +590,98 @@ class DltoolProgressCallback:
                 f"总工作量={self.fit_total}；训练阶段最多报告{self.FIT_PROGRESS_END}%",
             )
 
-    def update_fit(self, train_done: int, message: str) -> None:
+    def update_fit(self, trainer, train_done: int, outputs: Any, message: str, batch_idx: int | None = None,
+                   force: bool = False) -> None:
+        if batch_idx is not None:
+            self.last_epoch_current = min(
+                self.epoch_total, max(1, int(getattr(trainer, "current_epoch", 0)) + 1)
+            )
+            self.last_iter_current = min(
+                self.iter_total,
+                max(0, (self.last_epoch_current - 1) * self.train_batches_per_epoch + int(batch_idx) + 1),
+            )
+            self.last_phase_progress = int(100 * self.last_iter_current / max(1, self.iter_total))
+        elif force:
+            self.last_epoch_current = self.epoch_total
+            self.last_iter_current = self.iter_total
+            self.last_phase_progress = 100
+
+        self.last_loss = self.extract_loss(outputs, self.last_loss)
+        self.last_lr = self.extract_lr(trainer, self.last_lr)
         done = max(0, min(self.train_total, int(train_done))) + min(self.validation_done, self.validation_total)
-        self.update(done, self.fit_total, message, 0, self.FIT_PROGRESS_END)
+        self.update(
+            done,
+            self.fit_total,
+            message,
+            0,
+            self.FIT_PROGRESS_END,
+            force,
+            self.training_payload(),
+        )
 
-    def update_test(self, done: int, message: str, force: bool = False) -> None:
-        self.update(done, self.test_total, message, self.FIT_PROGRESS_END, self.TEST_PROGRESS_END, force)
+    def update_test(self, trainer, done: int, message: str, force: bool = False) -> None:
+        self.update(
+            done,
+            self.test_total,
+            message,
+            self.FIT_PROGRESS_END,
+            self.TEST_PROGRESS_END,
+            force,
+            self.evaluation_payload("test", done, self.test_total),
+        )
 
-    def update_predict(self, done: int, message: str, force: bool = False) -> None:
-        self.update(done, self.predict_total, message, 0, self.TEST_PROGRESS_END, force)
+    def update_predict(self, trainer, done: int, message: str, force: bool = False) -> None:
+        self.update(
+            done,
+            self.predict_total,
+            message,
+            0,
+            self.TEST_PROGRESS_END,
+            force,
+            self.evaluation_payload("test", done, self.predict_total),
+        )
+
+    @staticmethod
+    def extract_loss(outputs: Any, fallback: Any = None) -> Any:
+        value = outputs
+        if isinstance(outputs, dict):
+            value = next((outputs[key] for key in ("loss", "train_loss", "val_loss") if key in outputs), None)
+        if value is None:
+            return fallback
+        normalized = metric_value(value)
+        return normalized if isinstance(normalized, (int, float)) else fallback
+
+    @staticmethod
+    def extract_lr(trainer, fallback: Any = None) -> Any:
+        try:
+            optimizers = getattr(trainer, "optimizers", [])
+            if optimizers:
+                return float(optimizers[0].param_groups[0]["lr"])
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            pass
+        return fallback
+
+    def training_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "phase": "train",
+            "started": True,
+            "phase_progress": self.last_phase_progress,
+            "epoch": f"{self.last_epoch_current} / {self.epoch_total}",
+            "iter": f"{self.last_iter_current} / {self.iter_total}",
+            "lr": status_value_text(self.last_lr),
+            "loss": status_value_text(self.last_loss),
+            "elapsed": elapsed_text(time.monotonic() - self.fit_start_time),
+        }
+        return payload
+
+    @staticmethod
+    def evaluation_payload(phase: str, done: int, total: int) -> dict[str, Any]:
+        bounded_done = max(0, min(int(total), int(done)))
+        return {
+            "phase": phase,
+            "started": True,
+            "phase_progress": int(100 * bounded_done / max(1, int(total))),
+        }
 
     def report_summary(self, phase: str) -> None:
         report_interval = (
@@ -546,6 +704,7 @@ class DltoolProgressCallback:
         progress_start: int,
         progress_end: int,
         force: bool = False,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         total = max(1, int(total))
         done = max(0, min(total, int(done)))
@@ -566,14 +725,14 @@ class DltoolProgressCallback:
             or done >= total
         )
         if should_report:
-            progress(self.client, self.task_id, self.current_progress, eta, message)
+            progress(self.client, self.task_id, self.current_progress, eta, message, **(payload or {}))
             self.last_report_time = now
             self.last_report_message = message
             self.report_count += 1
         self.check_stop()
 
-    def report_status(self, message: str) -> None:
-        status(self.client, self.task_id, TaskStatus.RUNNING, self.current_progress, -1, message)
+    def report_status(self, message: str, **payload: Any) -> None:
+        status(self.client, self.task_id, TaskStatus.RUNNING, self.current_progress, -1, message, **payload)
         self.check_stop()
 
     def check_stop(self) -> None:

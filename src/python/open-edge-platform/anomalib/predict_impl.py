@@ -11,6 +11,7 @@ from dltool_common import (
     create_task_client,
     group,
     load_config,
+    metrics_text,
     report_failure,
     report_result,
     status,
@@ -39,9 +40,11 @@ def main() -> int:
         engine = build_engine(config, "test_params", progress.callback)
         results = engine.test(model=model, datamodule=datamodule, ckpt_path=checkpoint_path)
 
+        final_payload = {"phase": "test", "started": True, "phase_progress": 100}
         if results:
             report_result(client, args, "测试评估", results)
-        status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, "测试完成")
+            final_payload["metrics"] = metrics_text(results)
+        status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, "测试完成", **final_payload)
         return 0
     except TaskStopRequested:
         return 2
