@@ -116,6 +116,14 @@ def batch_count(value: Any) -> int:
         return 0
 
 
+def dataloader_batch_count(value: Any) -> int:
+    try:
+        loader = value() if callable(value) else value
+        return batch_count(len(loader))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return 0
+
+
 
 
 def should_stop(client: TaskClient | None, task_id: int) -> bool:
@@ -410,9 +418,12 @@ def status_value_text(value: Any, digits: int = 6) -> str:
 
 def elapsed_text(seconds: Any) -> str:
     try:
-        total = max(0, int(round(float(seconds))))
+        value = float(seconds)
     except (TypeError, ValueError, OverflowError):
         return "-"
+    if value < 0:
+        return "-"
+    total = max(0, int(round(value)))
     hours, remainder = divmod(total, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
@@ -434,7 +445,7 @@ class DltoolProgressCallback:
             def on_fit_start(self, trainer, pl_module):
                 self.outer.configure_fit(trainer)
                 self.outer.report_runtime(trainer, "训练")
-                self.outer.report_status("开始训练", phase="train", started=True, phase_progress=0)
+                self.outer.report_status("开始训练", **self.outer.training_payload(-1))
 
             def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
                 self.outer.check_stop()
@@ -501,7 +512,14 @@ class DltoolProgressCallback:
         self.fit_total = 1
         self.epoch_total = 1
         self.train_batches_per_epoch = 1
+        self.steps_per_epoch = 1
         self.iter_total = 1
+        self.reported_train_batches: Any = 0
+        self.train_batches_source = "回退值"
+        self.accumulation = 1
+        self.max_epochs = -1
+        self.max_steps = -1
+        self.estimated_stepping_batches: Any = 0
         self.last_epoch_current = 0
         self.last_iter_current = 0
         self.last_phase_progress = 0
@@ -518,14 +536,37 @@ class DltoolProgressCallback:
         self.callback = CallbackImpl(self)
 
     def configure_fit(self, trainer) -> None:
-        self.train_total = max(1, batch_count(getattr(trainer, "estimated_stepping_batches", 1)))
-        train_batches = max(1, batch_count(getattr(trainer, "num_training_batches", 1)))
+        self.reported_train_batches = getattr(trainer, "num_training_batches", 0)
+        train_batches = batch_count(self.reported_train_batches)
+        self.train_batches_source = "trainer.num_training_batches"
+        if train_batches <= 0:
+            for name, value in (
+                ("trainer.train_dataloader", getattr(trainer, "train_dataloader", None)),
+                (
+                    "datamodule.train_dataloader",
+                    getattr(getattr(trainer, "datamodule", None), "train_dataloader", None),
+                ),
+            ):
+                train_batches = dataloader_batch_count(value)
+                if train_batches > 0:
+                    self.train_batches_source = name
+                    break
+        train_batches = max(1, train_batches)
         self.train_batches_per_epoch = train_batches
-        accumulation = batch_count(getattr(trainer, "accumulate_grad_batches", 1)) or 1
-        steps_per_epoch = max(1, math.ceil(train_batches / accumulation))
-        estimated_epochs = max(1, math.ceil(self.train_total / steps_per_epoch))
+        self.accumulation = batch_count(getattr(trainer, "accumulate_grad_batches", 1)) or 1
+        self.steps_per_epoch = max(1, math.ceil(train_batches / self.accumulation))
+        self.max_epochs = getattr(trainer, "max_epochs", -1)
+        self.max_steps = getattr(trainer, "max_steps", -1)
+        self.estimated_stepping_batches = getattr(trainer, "estimated_stepping_batches", 0)
+        self.train_total = batch_count(self.estimated_stepping_batches)
+        if self.train_total <= 0:
+            self.train_total = batch_count(self.max_steps)
+        if self.train_total <= 0:
+            self.train_total = batch_count(self.max_epochs) * self.steps_per_epoch
+        self.train_total = max(1, self.train_total)
+        estimated_epochs = max(1, math.ceil(self.train_total / self.steps_per_epoch))
         self.epoch_total = estimated_epochs
-        self.iter_total = max(1, estimated_epochs * train_batches)
+        self.iter_total = self.train_total
         validation_batches = batch_count(getattr(trainer, "num_val_batches", 0))
         check_every = getattr(trainer, "check_val_every_n_epoch", 1)
         if isinstance(check_every, int) and check_every > 0:
@@ -586,8 +627,14 @@ class DltoolProgressCallback:
             log(
                 self.client,
                 self.task_id,
-                f"{self.label}: 训练步数={self.train_total}, 预计验证批次={self.validation_total}, "
-                f"总工作量={self.fit_total}；训练阶段最多报告{self.FIT_PROGRESS_END}%",
+                f"{self.label}: 原始训练批次={self.reported_train_batches!r}, "
+                f"有效每轮训练批次={self.train_batches_per_epoch}（来源={self.train_batches_source}），"
+                f"梯度累积={self.accumulation}，每轮优化步数={self.steps_per_epoch}，"
+                f"max_epochs={self.max_epochs}，max_steps={self.max_steps}，"
+                f"estimated_stepping_batches={self.estimated_stepping_batches!r}；"
+                f"状态 Epoch 总数={self.epoch_total}，状态 Iter 总数={self.iter_total}，"
+                f"预计验证批次={self.validation_total}，总工作量={self.fit_total}；"
+                f"Iter 与 TensorBoard 使用同一 global_step，训练阶段最多报告{self.FIT_PROGRESS_END}%",
             )
 
     def update_fit(self, trainer, train_done: int, outputs: Any, message: str, batch_idx: int | None = None,
@@ -596,9 +643,10 @@ class DltoolProgressCallback:
             self.last_epoch_current = min(
                 self.epoch_total, max(1, int(getattr(trainer, "current_epoch", 0)) + 1)
             )
+            global_step = batch_count(getattr(trainer, "global_step", train_done))
             self.last_iter_current = min(
                 self.iter_total,
-                max(0, (self.last_epoch_current - 1) * self.train_batches_per_epoch + int(batch_idx) + 1),
+                max(0, global_step),
             )
             self.last_phase_progress = int(100 * self.last_iter_current / max(1, self.iter_total))
         elif force:
@@ -609,6 +657,7 @@ class DltoolProgressCallback:
         self.last_loss = self.extract_loss(outputs, self.last_loss)
         self.last_lr = self.extract_lr(trainer, self.last_lr)
         done = max(0, min(self.train_total, int(train_done))) + min(self.validation_done, self.validation_total)
+        eta_seconds = self.estimate_eta(done, self.fit_total)
         self.update(
             done,
             self.fit_total,
@@ -616,7 +665,7 @@ class DltoolProgressCallback:
             0,
             self.FIT_PROGRESS_END,
             force,
-            self.training_payload(),
+            self.training_payload(eta_seconds),
         )
 
     def update_test(self, trainer, done: int, message: str, force: bool = False) -> None:
@@ -661,7 +710,7 @@ class DltoolProgressCallback:
             pass
         return fallback
 
-    def training_payload(self) -> dict[str, Any]:
+    def training_payload(self, eta_seconds: int = -1) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "phase": "train",
             "started": True,
@@ -671,8 +720,20 @@ class DltoolProgressCallback:
             "lr": status_value_text(self.last_lr),
             "loss": status_value_text(self.last_loss),
             "elapsed": elapsed_text(time.monotonic() - self.fit_start_time),
+            "eta": elapsed_text(eta_seconds),
         }
         return payload
+
+    def estimate_eta(self, done: int, total: int) -> int:
+        total = max(1, int(total))
+        done = max(0, min(total, int(done)))
+        if done >= total:
+            return 0
+
+        elapsed = time.monotonic() - self.phase_start_time
+        if done <= 0 or elapsed <= 0:
+            return -1
+        return int(round(elapsed * (total - done) / done))
 
     @staticmethod
     def evaluation_payload(phase: str, done: int, total: int) -> dict[str, Any]:
@@ -711,10 +772,7 @@ class DltoolProgressCallback:
         value = progress_start + int((progress_end - progress_start) * done / total)
         value = min(progress_end, max(progress_start, value))
         self.current_progress = max(self.current_progress, value)
-        eta = -1
-        elapsed = time.monotonic() - self.phase_start_time
-        if done > 0 and elapsed > 0 and total > done:
-            eta = int(round(elapsed * (total - done) / done))
+        eta = self.estimate_eta(done, total)
         now = time.monotonic()
         should_report = (
             force
