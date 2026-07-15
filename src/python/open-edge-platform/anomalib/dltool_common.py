@@ -354,7 +354,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
     accelerator = text(trainer, "accelerator", "auto")
     devices = integer(trainer, "devices", 1)
     selected_device = text(trainer, "device", "auto").lower()
-    if selected_device.startswith("gpu:"):
+    if selected_device.startswith(("cuda:", "gpu:")):
         try:
             gpu_index = int(selected_device.split(":", 1)[1])
             if gpu_index >= 0:
