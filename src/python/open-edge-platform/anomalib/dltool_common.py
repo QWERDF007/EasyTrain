@@ -351,14 +351,29 @@ def build_engine(config: dict[str, Any], section: str, callback):
     from anomalib.loggers import AnomalibTensorBoardLogger
 
     trainer = group(config, section, "trainer") or group(config, section, "inference")
+    accelerator = text(trainer, "accelerator", "auto")
+    devices = integer(trainer, "devices", 1)
+    selected_device = text(trainer, "device", "auto").lower()
+    if selected_device.startswith("gpu:"):
+        try:
+            gpu_index = int(selected_device.split(":", 1)[1])
+            if gpu_index >= 0:
+                accelerator = "cuda"
+                devices = [gpu_index]
+        except (TypeError, ValueError):
+            pass
+    elif selected_device.startswith("cpu:"):
+        accelerator = "cpu"
+        devices = 1
+
     log_dir = text(config, "log_dir", "logs")
     tensorboard_logger = AnomalibTensorBoardLogger(save_dir=log_dir, name="", version="")
     kwargs: dict[str, Any] = {
         "callbacks": [callback],
         "logger": tensorboard_logger,
         "default_root_dir": text(trainer, "output_dir", "results"),
-        "accelerator": text(trainer, "accelerator", "auto"),
-        "devices": integer(trainer, "devices", 1),
+        "accelerator": accelerator,
+        "devices": devices,
         "num_sanity_val_steps": integer(trainer, "num_sanity_val_steps", 0),
     }
     max_epochs = integer(trainer, "max_epochs", 0)
