@@ -4,6 +4,7 @@ import sys
 import argparse
 import glob
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,15 @@ from torchvision.transforms import v2
 TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
     sys.path.insert(0, str(TASK_DIR))
+
+FS_SAM2_DIR = Path(__file__).resolve().parent
+if str(FS_SAM2_DIR) not in sys.path:
+    sys.path.insert(0, str(FS_SAM2_DIR))
+
+from prediction_augmentation import (
+    bounded,
+    predict_mask_with_augmentation,
+)
 
 from dltool_task_protocol import TaskStatus
 from dltool_task_reporting import (
@@ -129,6 +139,24 @@ def integer(values, name, default=0):
         return default
 
 
+def floating(values, name, default=0.0):
+    try:
+        return float(values.get(name, default)) if isinstance(values, dict) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def boolean(values, name, default=False):
+    if not isinstance(values, dict) or name not in values:
+        return default
+    value = values.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def apply_dltool_config(args):
     if not args.config:
         return
@@ -158,6 +186,65 @@ def apply_dltool_config(args):
     args.img_size = integer(inference, 'image_size', integer(model, 'image_size', args.img_size))
     args.sam2_checkpoint = text(model, 'sam2_checkpoint', args.sam2_checkpoint)
     args.sam2_cfg = text(model, 'sam2_cfg', args.sam2_cfg)
+
+    args.prediction_enhancement_enabled = boolean(
+        inference, 'prediction_enhancement_enabled', args.prediction_enhancement_enabled
+    )
+    args.prediction_horizontal_flip = boolean(
+        inference, 'prediction_horizontal_flip', args.prediction_horizontal_flip
+    )
+    args.prediction_vertical_flip = boolean(
+        inference, 'prediction_vertical_flip', args.prediction_vertical_flip
+    )
+    args.prediction_scale = bounded(
+        floating(inference, 'prediction_scale', args.prediction_scale), -0.9, 1.0
+    )
+    args.prediction_brightness = bounded(
+        floating(inference, 'prediction_brightness', args.prediction_brightness), -1.0, 1.0
+    )
+    args.prediction_contrast = bounded(
+        floating(inference, 'prediction_contrast', args.prediction_contrast), -1.0, 1.0
+    )
+    args.prediction_hue = bounded(
+        floating(inference, 'prediction_hue', args.prediction_hue), -0.5, 0.5
+    )
+    args.prediction_rotation = bounded(
+        floating(inference, 'prediction_rotation', args.prediction_rotation), -180.0, 180.0
+    )
+    args.prediction_iou_threshold = bounded(
+        floating(inference, 'prediction_iou_threshold', args.prediction_iou_threshold), 0.0, 1.0
+    )
+    args.prediction_min_vote_count = integer(
+        inference, 'prediction_min_vote_count', args.prediction_min_vote_count
+    )
+
+
+def clone_model_output(output):
+    """Clone the support memory before each independent query prediction."""
+    previous = {}
+    for key, value in output.items():
+        if isinstance(value, list):
+            previous[key] = [item.clone() if isinstance(item, torch.Tensor) else item for item in value]
+        elif isinstance(value, torch.Tensor):
+            previous[key] = value.clone()
+        else:
+            previous[key] = value
+    return previous
+
+
+def predict_query_mask(model, support_output, image, args, transform, device):
+    """Run the original single-image prediction path and return a binary uint8 mask."""
+    original_size = image.size
+    model_image = image.resize((args.img_size, args.img_size))
+    model_image = transform(model_image).unsqueeze(0).to(device)
+
+    autocast_context = torch.autocast(device_type='cuda', dtype=torch.bfloat16) if device.type == 'cuda' else nullcontext()
+    with torch.inference_mode(), autocast_context:
+        output = model(model_image, prev_out=clone_model_output(support_output))
+
+    logit_mask = output['logit_mask']
+    logit_mask = F.interpolate(logit_mask, (original_size[1], original_size[0]), mode='bilinear', align_corners=True)
+    return np.where(logit_mask.squeeze().detach().cpu().numpy() > 0.0, 255, 0).astype(np.uint8)
 
 
 def manifest_images(path):
@@ -296,21 +383,22 @@ def run_manifest_prediction(args, model, transform, device, task_client):
             print(f'  Processing [{class_name}] [{qid}]: {Path(qpath).stem}')
 
             img = Image.open(qpath).convert('RGB')
-            orig_size = img.size
-            img = img.resize((args.img_size, args.img_size))
-            img = transform(img).unsqueeze(0).to(device)
-
-            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                prev = {}
-                for k, v in current_out.items():
-                    prev[k] = [t.clone() for t in v] if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v
-                out = model(img, prev_out=prev)
-
-            logit_mask = out['logit_mask']
-            logit_mask = F.interpolate(logit_mask, (orig_size[1], orig_size[0]), mode='bilinear', align_corners=True)
-            pred_mask = (logit_mask.squeeze() > 0.0).float().cpu().numpy() * 255
+            pred_mask = predict_mask_with_augmentation(
+                img,
+                args,
+                lambda input_image: predict_query_mask(
+                    model, current_out, input_image, args, transform, device
+                ),
+                lambda input_image, _augmentation: predict_query_mask(
+                    model, current_out, input_image, args, transform, device
+                ),
+                check_stopped=lambda augmentation_progress: raise_if_task_stopped(
+                    task_client, args, augmentation_progress, -1
+                ),
+                progress=progress,
+            )
             out_path = os.path.join(class_output_dir, f'{qid}.png')
-            Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
+            Image.fromarray(pred_mask, mode='L').save(out_path)
 
             done += 1
             progress = task_progress(args, done, total_steps)
@@ -333,6 +421,16 @@ def main():
     parser.add_argument('--sam2_cfg', type=str, default='configs/sam2.1/sam2.1_hiera_b+.yaml')
     parser.add_argument('--kshot', type=int, default=1, help='Number of support images to use (default 1)')
     parser.add_argument('--img_size', type=int, default=1024, help='Image size for inference (default 1024)')
+    parser.add_argument('--prediction_enhancement_enabled', action='store_true', default=False)
+    parser.add_argument('--prediction_horizontal_flip', action='store_true', default=False)
+    parser.add_argument('--prediction_vertical_flip', action='store_true', default=False)
+    parser.add_argument('--prediction_scale', type=float, default=0.0)
+    parser.add_argument('--prediction_brightness', type=float, default=0.0)
+    parser.add_argument('--prediction_contrast', type=float, default=0.0)
+    parser.add_argument('--prediction_hue', type=float, default=0.0)
+    parser.add_argument('--prediction_rotation', type=float, default=0.0)
+    parser.add_argument('--prediction_iou_threshold', type=float, default=0.5)
+    parser.add_argument('--prediction_min_vote_count', type=int, default=2)
     parser.add_argument('--dltool_task_host', type=str, default='')
     parser.add_argument('--dltool_task_port', type=int, default=0)
     parser.add_argument('--dltool_task_id', type=int, default=-1)
@@ -430,22 +528,23 @@ def main():
             print(f'  Processing [{qid}]: {Path(qpath).stem}')
 
             img = Image.open(qpath).convert('RGB')
-            orig_size = img.size  # (W, H)
-            img = img.resize((args.img_size, args.img_size))
-            img = transform(img).unsqueeze(0).to(device)
-
-            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                prev = {}
-                for k, v in current_out.items():
-                    prev[k] = [t.clone() for t in v] if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v
-                out = model(img, prev_out=prev)
-
-            logit_mask = out['logit_mask']
-            logit_mask = F.interpolate(logit_mask, (orig_size[1], orig_size[0]), mode='bilinear', align_corners=True)
-            pred_mask = (logit_mask.squeeze() > 0.0).float().cpu().numpy() * 255
+            pred_mask = predict_mask_with_augmentation(
+                img,
+                args,
+                lambda input_image: predict_query_mask(
+                    model, current_out, input_image, args, transform, device
+                ),
+                lambda input_image, _augmentation: predict_query_mask(
+                    model, current_out, input_image, args, transform, device
+                ),
+                check_stopped=lambda augmentation_progress: raise_if_task_stopped(
+                    task_client, args, augmentation_progress, -1
+                ),
+                progress=progress,
+            )
 
             out_path = os.path.join(args.output_dir, f'{qid}.png')
-            Image.fromarray(pred_mask.astype(np.uint8)).save(out_path)
+            Image.fromarray(pred_mask, mode='L').save(out_path)
             progress = task_progress(args, index + 1, len(query_list))
             eta_seconds = estimate_task_eta(args, index + 1, len(query_list))
             report_task_progress(task_client, args, progress, eta_seconds, f"已推理 {index + 1}/{len(query_list)}")

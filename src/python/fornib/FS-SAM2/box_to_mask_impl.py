@@ -24,6 +24,16 @@ from dltool_task_reporting import (
     report_status as report_task_status,
 )
 
+FS_SAM2_DIR = Path(__file__).resolve().parent
+if str(FS_SAM2_DIR) not in sys.path:
+    sys.path.insert(0, str(FS_SAM2_DIR))
+
+from prediction_augmentation import (
+    bounded,
+    predict_mask_with_augmentation,
+    transform_prediction_box,
+)
+
 
 def task_progress(args, done, total):
     progress = args.dltool_progress_base + args.dltool_progress_span * done / max(1, total)
@@ -93,6 +103,24 @@ def text(values, name, default=""):
     return default if value is None else str(value).strip()
 
 
+def floating(values, name, default=0.0):
+    try:
+        return float(values.get(name, default)) if isinstance(values, dict) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def boolean(values, name, default=False):
+    if not isinstance(values, dict) or name not in values:
+        return default
+    value = values.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def apply_dltool_config(args):
     if not args.config:
         return []
@@ -110,6 +138,22 @@ def apply_dltool_config(args):
     model = group(config, "train_params", "model")
     args.sam2_checkpoint = text(model, "sam2_checkpoint", args.sam2_checkpoint)
     args.sam2_cfg = text(model, "sam2_cfg", args.sam2_cfg)
+    args.box_to_mask_prediction_enhancement_enabled = boolean(
+        model,
+        "box_to_mask_prediction_enhancement_enabled",
+        args.box_to_mask_prediction_enhancement_enabled,
+    )
+    args.prediction_horizontal_flip = boolean(model, "prediction_horizontal_flip", args.prediction_horizontal_flip)
+    args.prediction_vertical_flip = boolean(model, "prediction_vertical_flip", args.prediction_vertical_flip)
+    args.prediction_scale = bounded(floating(model, "prediction_scale", args.prediction_scale), -0.9, 1.0)
+    args.prediction_brightness = bounded(floating(model, "prediction_brightness", args.prediction_brightness), -1.0, 1.0)
+    args.prediction_contrast = bounded(floating(model, "prediction_contrast", args.prediction_contrast), -1.0, 1.0)
+    args.prediction_hue = bounded(floating(model, "prediction_hue", args.prediction_hue), -0.5, 0.5)
+    args.prediction_rotation = bounded(floating(model, "prediction_rotation", args.prediction_rotation), -180.0, 180.0)
+    args.prediction_iou_threshold = bounded(
+        floating(model, "prediction_iou_threshold", args.prediction_iou_threshold), 0.0, 1.0
+    )
+    args.prediction_min_vote_count = int(floating(model, "prediction_min_vote_count", args.prediction_min_vote_count))
     return manifests
 
 
@@ -217,6 +261,44 @@ def collect_label_entries(manifest, manifest_path):
     return entries
 
 
+def predict_box_mask(predictor, box):
+    """Run the original SAM2 box prompt and select its highest-IoU mask."""
+    masks, ious, _ = predictor.predict(box=box, multimask_output=True)
+    best_idx = int(np.argmax(ious))
+    return masks[best_idx].astype(np.uint8) * 255
+
+
+def predict_box_mask_with_augmentation(predictor, image_pil, box, args, task_client, progress):
+    """Predict a box mask through the shared fixed-TTA workflow."""
+    original_image = np.asarray(image_pil)
+    try:
+        predictor.set_image(original_image)
+        return predict_mask_with_augmentation(
+            image_pil,
+            args,
+            lambda _image: predict_box_mask(predictor, box),
+            lambda augmented_image, augmentation: _predict_augmented_box_mask(
+                predictor, augmented_image, augmentation, box, image_pil.size
+            ),
+            enabled_attribute="box_to_mask_prediction_enhancement_enabled",
+            check_stopped=lambda augmentation_progress: raise_if_task_stopped(
+                task_client, args, augmentation_progress, -1
+            ),
+            progress=progress,
+        )
+    finally:
+        predictor.set_image(original_image)
+
+
+def _predict_augmented_box_mask(predictor, augmented_image, augmentation, box, image_size):
+    predictor.set_image(np.asarray(augmented_image))
+    augmented_box = transform_prediction_box(box, augmentation, image_size)
+    augmented_box = clamp_box(augmented_box, image_size)
+    if augmented_box is None:
+        return None
+    return predict_box_mask(predictor, augmented_box)
+
+
 def generate_masks(args, manifest, task_client, finish_on_complete=True):
     entries = collect_label_entries(manifest, args.manifest)
     if not entries:
@@ -254,9 +336,7 @@ def generate_masks(args, manifest, task_client, finish_on_complete=True):
         if box_xyxy is None:
             raise ValueError(f"invalid box for image {image.get('id', image_path)} label {label.get('label_id', '')}")
 
-        masks, ious, _ = predictor.predict(box=box_xyxy, multimask_output=True)
-        best_idx = int(np.argmax(ious))
-        mask = masks[best_idx].astype(np.uint8) * 255
+        mask = predict_box_mask_with_augmentation(predictor, image_pil, box_xyxy, args, task_client, progress)
 
         output_path = Path(mask_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,10 +352,10 @@ def generate_masks(args, manifest, task_client, finish_on_complete=True):
     save_manifest(output_manifest, manifest)
     if finish_on_complete:
         report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, len(entries), len(entries)), 0,
-                           f"框转Mask完成 ({len(entries)} 个标注)")
+                           f"BoxToMask 完成 ({len(entries)} 个标注)")
     else:
         report_task_progress(task_client, args, task_progress(args, len(entries), len(entries)), 0,
-                             f"框转Mask完成 ({len(entries)} 个标注)")
+                             f"BoxToMask 完成 ({len(entries)} 个标注)")
     return 0
 
 
@@ -286,6 +366,16 @@ def main():
     parser.add_argument("--output_manifest", type=str, default="", help="Updated manifest path. Defaults to overwrite.")
     parser.add_argument("--sam2_checkpoint", type=str, default="", help="Path to SAM2 checkpoint")
     parser.add_argument("--sam2_cfg", type=str, default="", help="Path to SAM2 config YAML")
+    parser.add_argument("--box_to_mask_prediction_enhancement_enabled", action="store_true", default=False)
+    parser.add_argument("--prediction_horizontal_flip", action="store_true", default=False)
+    parser.add_argument("--prediction_vertical_flip", action="store_true", default=False)
+    parser.add_argument("--prediction_scale", type=float, default=0.0)
+    parser.add_argument("--prediction_brightness", type=float, default=0.0)
+    parser.add_argument("--prediction_contrast", type=float, default=0.0)
+    parser.add_argument("--prediction_hue", type=float, default=0.0)
+    parser.add_argument("--prediction_rotation", type=float, default=0.0)
+    parser.add_argument("--prediction_iou_threshold", type=float, default=0.5)
+    parser.add_argument("--prediction_min_vote_count", type=int, default=2)
     parser.add_argument("--dltool_task_host", type=str, default="")
     parser.add_argument("--dltool_task_port", type=int, default=0)
     parser.add_argument("--dltool_task_id", type=int, default=-1)
@@ -295,7 +385,7 @@ def main():
 
     task_client = create_task_client(args)
     try:
-        report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 SAM2 框转Mask")
+        report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 SAM2 BoxToMask")
         manifests = apply_dltool_config(args)
         if not manifests:
             if not args.manifest:
@@ -321,7 +411,7 @@ def main():
     except TaskStopRequested:
         return 130
     except Exception:
-        report_failure(task_client, args, "框转Mask")
+        report_failure(task_client, args, "BoxToMask")
         return 1
     finally:
         if task_client is not None:
