@@ -362,7 +362,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
                 devices = [gpu_index]
         except (TypeError, ValueError):
             pass
-    elif selected_device.startswith("cpu:"):
+    elif selected_device == "cpu" or selected_device.startswith("cpu:"):
         accelerator = "cpu"
         devices = 1
 
