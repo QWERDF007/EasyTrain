@@ -34,9 +34,41 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    config_path = Path(path).resolve()
+    with config_path.open("r", encoding="utf-8") as handle:
         loaded = yaml.safe_load(handle)
-    return loaded if isinstance(loaded, dict) else {}
+    if not isinstance(loaded, dict):
+        return {}
+
+    # Model task YAML stores artifact paths relative to the directory that
+    # owns that config (train/ or test/<task>/).  Expand only path-bearing
+    # fields for the running Python process; image paths inside manifests are
+    # intentionally left untouched because they use the project data source's
+    # own path convention.
+    path_keys = {
+        "model_dir",
+        "result_dir",
+        "log_dir",
+        "weight_dir",
+        "prediction_dir",
+        "file_list",
+        "manifest",
+        "masks_dir",
+        "output_dir",
+        "checkpoint_path",
+    }
+
+    def resolve_paths(value: Any, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {name: resolve_paths(item, name) for name, item in value.items()}
+        if isinstance(value, list):
+            return [resolve_paths(item, key) for item in value]
+        if key not in path_keys or not isinstance(value, str) or not value.strip():
+            return value
+        candidate = Path(value)
+        return str(candidate if candidate.is_absolute() else (config_path.parent / candidate).resolve())
+
+    return resolve_paths(loaded)
 
 
 def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
@@ -198,6 +230,15 @@ class DltoolCustomDataModule:
                     table = DataFrame(columns=["id", "image_path", "label_index", "split", "mask_path"])
                 return TabularDataset(name=self.name, samples=table, split=split, root=None)
 
+            @property
+            def test_image_ids(self) -> dict[str, str]:
+                """Return database image IDs keyed by their exported image paths."""
+                return {
+                    str(sample["image_path"]): str(sample["id"])
+                    for sample in self._test_samples
+                    if sample.get("image_path") and sample.get("id") is not None
+                }
+
             def _setup(self, _stage: str | None = None) -> None:
                 self.train_data = self._dataset(self._train_samples, Split.TRAIN)
                 self.test_data = self._dataset(self._test_samples, Split.TEST)
@@ -294,7 +335,11 @@ def dltool_file_list_samples(
     return result
 
 
-def build_model(config: dict[str, Any], section: str = "train_params"):
+def build_model(
+    config: dict[str, Any],
+    section: str = "train_params",
+    visualizer: bool = True,
+):
     architecture = str(config.get("model_architecture", "")).strip().lower()
     model_params = group(config, section, "model") or group(config, "train_params", "model")
 
@@ -314,6 +359,7 @@ def build_model(config: dict[str, Any], section: str = "train_params"):
             num_neighbors=integer(model_params, "num_neighbors", 9),
             precision=text(model_params, "precision", "float32"),
             pre_processor=pre_processor,
+            visualizer=visualizer,
         )
 
     if architecture == "dinomaly2":
@@ -341,12 +387,14 @@ def build_model(config: dict[str, Any], section: str = "train_params"):
             precision=text(model_params, "precision", "float32"),
             pre_processor=pre_processor,
             evaluator=evaluator,
+            visualizer=visualizer,
         )
 
     raise ValueError(f"Unsupported anomalib architecture: {architecture}")
 
 
 def build_engine(config: dict[str, Any], section: str, callback):
+    from anomalib.callbacks.checkpoint import ModelCheckpoint
     from anomalib.engine import Engine
     from anomalib.loggers import AnomalibTensorBoardLogger
 
@@ -368,10 +416,36 @@ def build_engine(config: dict[str, Any], section: str, callback):
 
     log_dir = text(config, "log_dir", "logs")
     tensorboard_logger = AnomalibTensorBoardLogger(save_dir=log_dir, name="", version="")
+    callbacks = [callback]
+    default_root_dir = text(trainer, "output_dir", "results")
+    if section == "train_params":
+        # Keep the checkpoint at the model-level weights directory. Anomalib's
+        # default callback puts it below the trainer workspace in results.
+        weight_dir = text(config, "weight_dir")
+        if not weight_dir:
+            model_dir = text(config, "model_dir")
+            if model_dir:
+                weight_dir = str(Path(model_dir) / "weights")
+            else:
+                output_dir = text(trainer, "output_dir", "results")
+                weight_dir = str(Path(output_dir).parent / "weights")
+        # Keep the trainer workspace out of results during training as well.
+        default_root_dir = weight_dir
+        callbacks.insert(
+            0,
+            ModelCheckpoint(
+                dirpath=Path(weight_dir),
+                filename="model",
+                auto_insert_metric_name=False,
+                save_top_k=1,
+                save_last=False,
+                enable_version_counter=False,
+            ),
+        )
     kwargs: dict[str, Any] = {
-        "callbacks": [callback],
+        "callbacks": callbacks,
         "logger": tensorboard_logger,
-        "default_root_dir": text(trainer, "output_dir", "results"),
+        "default_root_dir": default_root_dir,
         "accelerator": accelerator,
         "devices": devices,
         "num_sanity_val_steps": integer(trainer, "num_sanity_val_steps", 0),

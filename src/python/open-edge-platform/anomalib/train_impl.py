@@ -36,7 +36,7 @@ def main() -> int:
         status(client, args.dltool_task_id, TaskStatus.RUNNING, 0, -1, "开始 anomalib 训练")
 
         datamodule = build_datamodule(config, "train_params")
-        model = build_model(config, "train_params")
+        model = build_model(config, "train_params", visualizer=False)
         engine = build_engine(config, "train_params", progress.callback)
         engine.fit(model=model, datamodule=datamodule)
         results = engine.test(model=model, datamodule=datamodule)
