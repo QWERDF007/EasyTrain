@@ -120,12 +120,18 @@ def boolean(values: dict[str, Any], name: str, default: bool = False) -> bool:
 
 
 def string_list(values: dict[str, Any], name: str, default: list[str] | None = None) -> list[str]:
+    fallback = list(default or [])
+    if not isinstance(values, dict) or name not in values or values.get(name) is None:
+        return fallback
+
     value = scalar(values.get(name))
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
+        result = [str(item).strip() for item in value if str(item).strip()]
+        return result or fallback
     if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return default or []
+        result = [item.strip() for item in value.split(",") if item.strip()]
+        return result or fallback
+    return fallback
 
 
 def square_size(values: dict[str, Any], name: str, default: int) -> tuple[int, int]:
