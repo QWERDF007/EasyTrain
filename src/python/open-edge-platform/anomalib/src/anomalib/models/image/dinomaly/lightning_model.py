@@ -117,6 +117,8 @@ class Dinomaly(AnomalibModule):
             from Dinomaly2. When enabled, the class token is subtracted from patch
             features before reconstruction. Most beneficial in multi-class settings.
             Incompatible with ``remove_class_token=True``. Defaults to False.
+        learning_rate (float): Initial learning rate used by the StableAdamW
+            optimizer and the warm cosine scheduler. Defaults to ``2e-3``.
         precision (str | PrecisionType): Numerical precision for model parameters.
             Supports "float16" and "float32". Defaults to "float32".
         pre_processor (PreProcessor | bool, optional): Pre-processor instance or
@@ -164,12 +166,17 @@ class Dinomaly(AnomalibModule):
         fuse_layer_decoder: list[list[int]] | None = None,
         remove_class_token: bool = False,
         use_context_recentering: bool = False,
+        learning_rate: float = 2e-3,
         precision: str | PrecisionType = PrecisionType.FLOAT32,
         pre_processor: PreProcessor | bool = True,
         post_processor: PostProcessor | bool = True,
         evaluator: Evaluator | bool = True,
         visualizer: Visualizer | bool = True,
     ) -> None:
+        if learning_rate <= 0:
+            msg = f"Learning rate must be positive, got {learning_rate}"
+            raise ValueError(msg)
+
         super().__init__(
             pre_processor=pre_processor,
             post_processor=post_processor,
@@ -212,6 +219,7 @@ class Dinomaly(AnomalibModule):
             param.requires_grad = True
 
         self.trainable_modules = torch.nn.ModuleList([self.model.bottleneck, self.model.decoder])
+        self.learning_rate = learning_rate
         self._initialize_trainable_modules(self.trainable_modules)
 
     @classmethod
@@ -337,7 +345,8 @@ class Dinomaly(AnomalibModule):
             - Only bottleneck MLP and decoder parameters are trained
             - Uses truncated normal initialization for Linear layers
             - Learning rate schedule: warmup (100 steps) + cosine decay
-            - Base learning rate: 2e-3, final learning rate: 2e-4
+            - Base learning rate: ``self.learning_rate``, final learning rate is
+              scaled from the default 2e-4 value
             - Total steps determined from trainer's max_steps or max_epochs
         """
         # Determine total training steps dynamically from trainer configuration
@@ -364,14 +373,25 @@ class Dinomaly(AnomalibModule):
             # Both are set, use the minimum (training stops at whichever comes first)
             total_steps = min(max_steps, max_epochs * len(self.trainer.datamodule.train_dataloader()))
 
-        optimizer_config = TRAINING_CONFIG["optimizer"]
+        total_steps = max(1, int(total_steps))
+
+        optimizer_config = TRAINING_CONFIG["optimizer"].copy()
         assert isinstance(optimizer_config, dict)
+        optimizer_config["lr"] = self.learning_rate
         optimizer = StableAdamW([{"params": self.trainable_modules.parameters()}], **optimizer_config)
 
         # Create a scheduler config with dynamically determined total steps
         scheduler_config = TRAINING_CONFIG["scheduler"].copy()
         assert isinstance(scheduler_config, dict)
         scheduler_config["total_iters"] = total_steps
+        scheduler_config["base_value"] = self.learning_rate
+        default_base_value = float(TRAINING_CONFIG["scheduler"]["base_value"])
+        default_final_value = float(TRAINING_CONFIG["scheduler"]["final_value"])
+        scheduler_config["final_value"] = self.learning_rate * default_final_value / default_base_value
+        scheduler_config["warmup_iters"] = min(
+            int(scheduler_config["warmup_iters"]),
+            max(0, total_steps - 1),
+        )
 
         lr_scheduler = WarmCosineScheduler(optimizer, **scheduler_config)
 

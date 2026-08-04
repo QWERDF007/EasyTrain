@@ -29,7 +29,8 @@ def main() -> int:
         from lightning.pytorch import seed_everything
 
         config = load_config(args.config)
-        seed = integer(group(config, "train_params", "trainer"), "seed", 42)
+        training = group(config, "train_params", "training")
+        seed = integer(training, "seed", 42)
         seed_everything(seed, workers=True)
 
         progress = DltoolProgressCallback(client, args.dltool_task_id, "anomalib train")

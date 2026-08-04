@@ -72,7 +72,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
 
 def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
-    value = config.get(section, {}).get(name, {})
+    section_values = config.get(section, {})
+    if not isinstance(section_values, dict):
+        return {}
+    value = section_values.get(name, {})
     return value if isinstance(value, dict) else {}
 
 
@@ -169,7 +172,10 @@ def should_stop(client: TaskClient | None, task_id: int) -> bool:
 
 
 def build_datamodule(config: dict[str, Any], section: str):
-    data = group(config, section, "data")
+    data_group = "training" if section == "train_params" else "data"
+    data = group(config, section, data_group)
+    batch_size = integer(data, "batch_size", 32)
+    eval_batch_size = batch_size
     if section == "train_params":
         train_samples = dltool_file_list_samples(config, "train", split="train", normal_only=True)
         validation_samples = dltool_file_list_samples(config, "validation", split="test", required=False)
@@ -178,8 +184,8 @@ def build_datamodule(config: dict[str, Any], section: str):
             train_samples=train_samples,
             validation_samples=validation_samples,
             test_samples=validation_samples,
-            train_batch_size=integer(data, "train_batch_size", 32),
-            eval_batch_size=integer(data, "eval_batch_size", 32),
+            train_batch_size=batch_size,
+            eval_batch_size=eval_batch_size,
             num_workers=integer(data, "num_workers", 8),
         )
 
@@ -189,8 +195,8 @@ def build_datamodule(config: dict[str, Any], section: str):
         train_samples=[],
         validation_samples=[],
         test_samples=test_samples,
-        train_batch_size=integer(data, "train_batch_size", 32),
-        eval_batch_size=integer(data, "eval_batch_size", 32),
+        train_batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
         num_workers=integer(data, "num_workers", 8),
     )
 
@@ -347,11 +353,14 @@ def build_model(
     visualizer: bool = True,
 ):
     architecture = str(config.get("model_architecture", "")).strip().lower()
-    model_params = group(config, section, "model") or group(config, "train_params", "model")
+    model_params = group(config, "train_params", "network")
+    training_params = group(config, "train_params", "training")
 
     if architecture == "patchcore":
         from anomalib.models import Patchcore
 
+        if integer(model_params, "image_channels", 3) != 3:
+            raise ValueError("PatchCore currently supports RGB images with 3 channels only")
         crop = integer(model_params, "center_crop_size", 0)
         pre_processor = Patchcore.configure_pre_processor(
             image_size=square_size(model_params, "image_size", 256),
@@ -361,9 +370,17 @@ def build_model(
             backbone=text(model_params, "backbone", "wide_resnet50_2"),
             layers=string_list(model_params, "layers", ["layer2", "layer3"]),
             pre_trained=boolean(model_params, "pre_trained", True),
-            coreset_sampling_ratio=floating(model_params, "coreset_sampling_ratio", 0.1),
-            num_neighbors=integer(model_params, "num_neighbors", 9),
-            precision=text(model_params, "precision", "float32"),
+            coreset_sampling_ratio=floating(
+                training_params,
+                "coreset_sampling_ratio",
+                floating(model_params, "coreset_sampling_ratio", 0.1),
+            ),
+            num_neighbors=integer(
+                training_params,
+                "num_neighbors",
+                integer(model_params, "num_neighbors", 9),
+            ),
+            precision=text(training_params, "precision", text(model_params, "precision", "float32")),
             pre_processor=pre_processor,
             visualizer=visualizer,
         )
@@ -372,6 +389,8 @@ def build_model(
         from anomalib.models import Dinomaly
         from anomalib.metrics import AUPRO, Evaluator
 
+        if integer(model_params, "image_channels", 3) != 3:
+            raise ValueError("Dinomaly currently supports RGB images with 3 channels only")
         pre_processor = Dinomaly.configure_pre_processor(
             image_size=square_size(model_params, "image_size", 448),
             crop_size=integer(model_params, "crop_size", 392),
@@ -387,10 +406,19 @@ def build_model(
         )
         return Dinomaly(
             encoder_name=text(model_params, "encoder_name", "dinov2reg_vit_base_14"),
-            decoder_depth=integer(model_params, "decoder_depth", 8),
-            bottleneck_dropout=floating(model_params, "bottleneck_dropout", 0.2),
-            use_context_recentering=boolean(model_params, "use_context_recentering", True),
-            precision=text(model_params, "precision", "float32"),
+            decoder_depth=integer(training_params, "decoder_depth", integer(model_params, "decoder_depth", 8)),
+            bottleneck_dropout=floating(
+                training_params,
+                "bottleneck_dropout",
+                floating(model_params, "bottleneck_dropout", 0.2),
+            ),
+            use_context_recentering=boolean(
+                training_params,
+                "use_context_recentering",
+                boolean(model_params, "use_context_recentering", True),
+            ),
+            precision=text(training_params, "precision", text(model_params, "precision", "float32")),
+            learning_rate=floating(training_params, "learning_rate", 2e-3),
             pre_processor=pre_processor,
             evaluator=evaluator,
             visualizer=visualizer,
@@ -404,10 +432,11 @@ def build_engine(config: dict[str, Any], section: str, callback):
     from anomalib.engine import Engine
     from anomalib.loggers import AnomalibTensorBoardLogger
 
-    trainer = group(config, section, "trainer") or group(config, section, "inference")
-    accelerator = text(trainer, "accelerator", "auto")
-    devices = integer(trainer, "devices", 1)
-    selected_device = text(trainer, "device", "auto").lower()
+    runtime_group = "training" if section == "train_params" else "inference"
+    runtime_params = group(config, section, runtime_group)
+    accelerator = "auto"
+    devices: int | list[int] = 1
+    selected_device = text(runtime_params, "device", "auto").lower()
     if selected_device.startswith(("cuda:", "gpu:")):
         try:
             gpu_index = int(selected_device.split(":", 1)[1])
@@ -416,6 +445,8 @@ def build_engine(config: dict[str, Any], section: str, callback):
                 devices = [gpu_index]
         except (TypeError, ValueError):
             pass
+    elif selected_device in {"cuda", "gpu"}:
+        accelerator = "cuda"
     elif selected_device == "cpu" or selected_device.startswith("cpu:"):
         accelerator = "cpu"
         devices = 1
@@ -423,7 +454,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
     log_dir = text(config, "log_dir", "logs")
     tensorboard_logger = AnomalibTensorBoardLogger(save_dir=log_dir, name="", version="")
     callbacks = [callback]
-    default_root_dir = text(trainer, "output_dir", "results")
+    default_root_dir = text(runtime_params, "output_dir", "results")
     if section == "train_params":
         # Keep the checkpoint at the model-level weights directory. Anomalib's
         # default callback puts it below the trainer workspace in results.
@@ -433,7 +464,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
             if model_dir:
                 weight_dir = str(Path(model_dir) / "weights")
             else:
-                output_dir = text(trainer, "output_dir", "results")
+                output_dir = text(runtime_params, "output_dir", "results")
                 weight_dir = str(Path(output_dir).parent / "weights")
         # Keep the trainer workspace out of results during training as well.
         default_root_dir = weight_dir
@@ -454,10 +485,10 @@ def build_engine(config: dict[str, Any], section: str, callback):
         "default_root_dir": default_root_dir,
         "accelerator": accelerator,
         "devices": devices,
-        "num_sanity_val_steps": integer(trainer, "num_sanity_val_steps", 0),
+        "num_sanity_val_steps": integer(runtime_params, "num_sanity_val_steps", 0),
     }
-    max_epochs = integer(trainer, "max_epochs", 0)
-    max_steps = integer(trainer, "max_steps", 0)
+    max_epochs = integer(runtime_params, "max_epochs", 0)
+    max_steps = integer(runtime_params, "max_steps", 0)
     if max_epochs > 0:
         kwargs["max_epochs"] = max_epochs
     if max_steps > 0:
