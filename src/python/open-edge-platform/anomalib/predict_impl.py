@@ -1,4 +1,6 @@
 import argparse
+import json
+import sqlite3
 from pathlib import Path
 
 from dltool_common import (
@@ -11,7 +13,7 @@ from dltool_common import (
     build_model,
     create_task_client,
     group,
-    load_config,
+    load_database_config,
     report_failure,
     status,
     text,
@@ -103,24 +105,17 @@ def save_prediction_score_maps(predictions, output_dir: str, image_ids: dict[str
     return saved
 
 
-def save_normalized_manifest(
-    predictions,
-    output_dir: str,
-    image_ids: dict[str, str],
-    model_uuid: str,
-    test_task_uuid: str,
-    method: str,
-) -> int:
-    """Persist image-level anomaly scores using the shared PRED protocol."""
-    import yaml
-
+def save_prediction_records(predictions, task_db: str, image_ids: dict[str, str]) -> int:
+    """Persist image-level scores in task.db.prediction."""
     if predictions is None:
         predictions = []
     if not isinstance(predictions, (list, tuple)):
         predictions = [predictions]
+    if not task_db:
+        raise ValueError("task_db is empty")
+
     image_lookup = build_image_id_lookup(image_ids)
-    records = []
-    serial = 0
+    records: list[tuple[int, str]] = []
     for batch in predictions:
         for item in batch:
             image_path = getattr(item, "image_path", None)
@@ -134,28 +129,14 @@ def save_normalized_manifest(
             score = getattr(item, "pred_score", getattr(item, "anomaly_score", 0.0))
             if hasattr(score, "detach"):
                 score = score.detach().cpu().item()
-            serial += 1
-            records.append(
-                {
-                    "prediction_id": f"pred-{serial}",
-                    "image_id": int(image_id),
-                    "class_id": 1,
-                    "class_name": "anomaly",
-                    "score": float(score),
-                }
-            )
-    manifest = {
-        "schema_version": 1,
-        "model_uuid": model_uuid,
-        "test_task_uuid": test_task_uuid,
-        "method": method,
-        "record_count": len(records),
-        "records": records,
-    }
-    output_path = Path(output_dir) / "manifest.yaml"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(manifest, stream, allow_unicode=True, sort_keys=False)
+            records.append((int(image_id), json.dumps({"image_score": float(score)})))
+
+    with sqlite3.connect(task_db) as connection:
+        connection.executemany(
+            "INSERT INTO prediction (image_id, data) VALUES (?, ?) "
+            "ON CONFLICT(image_id) DO UPDATE SET data=excluded.data",
+            records,
+        )
     return len(records)
 
 
@@ -166,7 +147,7 @@ def main() -> int:
 
     client = create_task_client(args)
     try:
-        config = load_config(args.config)
+        config = load_database_config(args, "test_params")
         inference = group(config, "test_params", "inference")
         checkpoint_path = text(inference, "checkpoint_path")
         if not checkpoint_path:
@@ -191,19 +172,9 @@ def main() -> int:
             return_predictions=True,
         )
         save_prediction_score_maps(predictions, result_dir, datamodule.test_image_ids)
-        prediction_count = save_normalized_manifest(
-            predictions,
-            result_dir,
-            datamodule.test_image_ids,
-            text(config, "model_uuid"),
-            text(config, "test_task_uuid"),
-            text(config, "method", text(config, "task_type", "test")),
-        )
+        prediction_count = save_prediction_records(predictions, args.task_db, datamodule.test_image_ids)
 
         final_payload = {"phase": "test", "started": True, "phase_progress": 100}
-        # The manifest is the canonical prediction protocol.  A model may
-        # provide image-level scores without an anomaly_map, so the number of
-        # TIFF artifacts is not the number of predictions used by C++.
         final_payload["prediction_count"] = prediction_count
         final_payload["output_dir"] = str(Path(result_dir))
         status(client, args.dltool_task_id, TaskStatus.FINISHED, 100, 0, "预测完成", **final_payload)

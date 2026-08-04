@@ -11,7 +11,7 @@ from dltool_common import (
     create_task_client,
     group,
     integer,
-    load_config,
+    load_database_config,
     metrics_text,
     report_failure,
     report_result,
@@ -28,7 +28,7 @@ def main() -> int:
     try:
         from lightning.pytorch import seed_everything
 
-        config = load_config(args.config)
+        config = load_database_config(args, "train_params")
         training = group(config, "train_params", "training")
         seed = integer(training, "seed", 42)
         seed_everything(seed, workers=True)

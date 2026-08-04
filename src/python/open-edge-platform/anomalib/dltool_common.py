@@ -1,11 +1,12 @@
 import argparse
-import math
+import argparse
+import csv
+import json
 import sys
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "src"
@@ -27,48 +28,95 @@ from dltool_task_reporting import (  # noqa: E402
 
 
 def add_task_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--model_db", required=True)
+    parser.add_argument("--task_db", default="")
+    parser.add_argument("--project_db", default="")
+    parser.add_argument("--model_root", default="")
+    parser.add_argument("--dataset_dir", required=True)
+    parser.add_argument("--test_file_list", default="")
+    parser.add_argument("--weight_dir", default="")
+    parser.add_argument("--log_dir", default="")
+    parser.add_argument("--model_uuid", default="")
+    parser.add_argument("--model_architecture", default="")
+    parser.add_argument("--method", default="")
+    parser.add_argument("--prediction_dir", default="")
     parser.add_argument("--dltool_task_host", default="")
     parser.add_argument("--dltool_task_port", type=int, default=0)
     parser.add_argument("--dltool_task_id", type=int, default=-1)
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
-    config_path = Path(path).resolve()
-    with config_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
-    if not isinstance(loaded, dict):
-        return {}
+def _insert_value(target: dict[str, Any], name: str, value: Any) -> None:
+    parts = [part for part in str(name).split(".") if part]
+    current = target
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    if parts:
+        current[parts[-1]] = value
 
-    # Model task YAML stores artifact paths relative to the directory that
-    # owns that config (train/ or test/<task>/).  Expand only path-bearing
-    # fields for the running Python process; image paths inside manifests are
-    # intentionally left untouched because they use the project data source's
-    # own path convention.
-    path_keys = {
-        "model_dir",
-        "result_dir",
-        "log_dir",
-        "weight_dir",
-        "prediction_dir",
-        "file_list",
-        "manifest",
-        "masks_dir",
-        "output_dir",
-        "checkpoint_path",
+
+def _load_params(database_path: str | Path, table: str) -> dict[str, Any]:
+    path = Path(database_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"database not found: {path}")
+    if table not in {"train_params", "test_params"}:
+        raise ValueError(f"unsupported parameter table: {table}")
+
+    result: dict[str, Any] = {}
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(f"SELECT name_en, value FROM {table} ORDER BY name_en").fetchall()
+    for name, encoded in rows:
+        _insert_value(result, str(name), json.loads(encoded))
+    return result
+
+
+def load_database_config(args: argparse.Namespace, section: str) -> dict[str, Any]:
+    """Build the runner view from model.db/task.db and the model file lists."""
+    train_params = _load_params(args.model_db, "train_params")
+    test_params = _load_params(args.task_db, "test_params") if args.task_db else {}
+    config: dict[str, Any] = {
+        "model_uuid": args.model_uuid,
+        "model_architecture": args.model_architecture,
+        "method": args.method,
+        "model_dir": args.model_root,
+        "weight_dir": args.weight_dir,
+        "log_dir": args.log_dir,
+        "result_dir": args.prediction_dir,
+        "prediction_dir": args.prediction_dir,
+        "train_params": train_params,
+        "test_params": test_params,
+        "datasets": {},
     }
 
-    def resolve_paths(value: Any, key: str = "") -> Any:
-        if isinstance(value, dict):
-            return {name: resolve_paths(item, name) for name, item in value.items()}
-        if isinstance(value, list):
-            return [resolve_paths(item, key) for item in value]
-        if key not in path_keys or not isinstance(value, str) or not value.strip():
-            return value
-        candidate = Path(value)
-        return str(candidate if candidate.is_absolute() else (config_path.parent / candidate).resolve())
+    dataset_root = Path(args.dataset_dir)
+    for split in ("train", "validation", "test"):
+        file_list = (
+            Path(args.test_file_list)
+            if split == "test" and args.test_file_list
+            else dataset_root / "test.txt"
+            if split == "test"
+            else dataset_root / f"{split}.txt"
+        )
+        if file_list.is_file():
+            config["datasets"][split] = {
+                "file_list": str(file_list),
+                "masks_dir": str(dataset_root / "masks"),
+            }
 
-    return resolve_paths(loaded)
+    if section == "test_params":
+        inference = dict(group(config, "test_params", "inference"))
+        if args.prediction_dir:
+            inference["output_dir"] = args.prediction_dir
+        checkpoint = text(inference, "checkpoint_path")
+        if checkpoint and not Path(checkpoint).is_absolute():
+            candidates = [Path(args.model_root) / checkpoint, Path(args.weight_dir) / checkpoint]
+            checkpoint = str(next((candidate for candidate in candidates if candidate.is_file()), candidates[-1]))
+            inference["checkpoint_path"] = checkpoint
+        config["test_params"]["inference"] = inference
+    return config
 
 
 def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
@@ -288,15 +336,49 @@ def dataset_masks_dir(config: dict[str, Any], split: str) -> str:
     return text(dataset_entry(config, split), "masks_dir")
 
 
-def load_file_list(path: str | Path) -> dict[str, Any]:
+def load_file_list(path: str | Path, load_labels: bool = True) -> dict[str, Any]:
     list_path = Path(path)
     if not list_path.is_file():
         raise FileNotFoundError(f"dataset file list not found: {list_path}")
-    with list_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
-    if not isinstance(loaded, dict):
-        raise ValueError(f"dataset file list is not a mapping: {list_path}")
-    return loaded
+
+    rows: list[dict[str, Any]] = []
+    with list_path.open("r", encoding="utf-8", newline="") as handle:
+        for row in csv.reader(handle):
+            if not row or row[0].strip().lower() == "image_id" or len(row) < 2:
+                continue
+            image_id = row[0].strip()
+            image_path = row[1].strip()
+            if image_id and image_path:
+                rows.append({"id": image_id, "path": image_path})
+
+    loaded: Any = {}
+    labels_path = list_path.with_name(f"{list_path.stem}_labels.json")
+    if load_labels and labels_path.is_file():
+        with labels_path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    if isinstance(loaded, list):
+        label_items = loaded
+        masks_dir = ""
+    elif isinstance(loaded, dict):
+        label_items = loaded.get("samples", [])
+        masks_dir = str(loaded.get("masks_dir", ""))
+    else:
+        raise ValueError(f"dataset label file is invalid: {labels_path}")
+
+    by_id = {
+        str(item.get("id", "")).strip(): dict(item)
+        for item in label_items
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    }
+    samples: list[dict[str, Any]] = []
+    for row in rows:
+        sample = by_id.get(row["id"], {})
+        sample["id"] = row["id"]
+        sample["path"] = row["path"]
+        samples.append(sample)
+    if not samples:
+        raise ValueError(f"dataset file list has no usable images: {list_path}")
+    return {"samples": samples, "masks_dir": masks_dir}
 
 
 def dltool_file_list_samples(
@@ -312,7 +394,9 @@ def dltool_file_list_samples(
             raise ValueError(f"datasets.{dataset_split}.file_list is empty")
         return []
 
-    file_list = load_file_list(file_list_path)
+    # Test labels are deliberately not exported.  Ground truth is rebuilt by
+    # the C++ evaluator from task.db and the project database.
+    file_list = load_file_list(file_list_path, load_labels=dataset_split != "test")
     masks_dir = dataset_masks_dir(config, dataset_split) or text(file_list, "masks_dir")
     samples = file_list.get("samples", [])
     if not isinstance(samples, list):

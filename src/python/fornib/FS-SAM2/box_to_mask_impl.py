@@ -1,4 +1,4 @@
-r"""Generate custom manifest label masks from bounding boxes using SAM2."""
+r"""Generate label masks from bounding boxes using SAM2."""
 import argparse
 import os
 import sys
@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import PIL.Image as Image
 import torch
-import yaml
 
 TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
@@ -27,6 +26,8 @@ from dltool_task_reporting import (
 FS_SAM2_DIR = Path(__file__).resolve().parent
 if str(FS_SAM2_DIR) not in sys.path:
     sys.path.insert(0, str(FS_SAM2_DIR))
+
+from dltool_database import load_split_records, load_train_params
 
 from prediction_augmentation import (
     bounded,
@@ -62,33 +63,6 @@ def raise_if_task_stopped(client, args, progress=-1, eta_seconds=-1):
         raise TaskStopRequested()
 
 
-def load_manifest(path):
-    manifest_path = Path(path)
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"manifest not found: {manifest_path}")
-    with manifest_path.open("r", encoding="utf-8") as handle:
-        manifest = yaml.safe_load(handle) or {}
-    if not isinstance(manifest, dict):
-        raise ValueError(f"manifest is not a mapping: {manifest_path}")
-    images = manifest.get("images", [])
-    if not isinstance(images, list):
-        raise ValueError(f"manifest images is not a list: {manifest_path}")
-    return manifest
-
-
-def save_manifest(path, manifest):
-    manifest_path = Path(path)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(manifest, handle, allow_unicode=True, sort_keys=False)
-
-
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
-    return loaded if isinstance(loaded, dict) else {}
-
-
 def group(values, *keys):
     current = values
     for key in keys:
@@ -121,21 +95,14 @@ def boolean(values, name, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def apply_dltool_config(args):
-    if not args.config:
-        return []
+def apply_database_config(args):
+    if not args.model_db:
+        raise ValueError("model_db is empty")
+    if not args.dataset_dir:
+        raise ValueError("dataset_dir is empty")
 
-    config = load_config(args.config)
-    datasets = group(config, "datasets")
-    manifests = []
-    for split_name in ("train", "validation"):
-        manifest = text(group(datasets, split_name), "manifest")
-        if manifest:
-            manifests.append(manifest)
-    if not manifests:
-        raise ValueError("datasets.train.manifest is empty")
-
-    model = group(config, "train_params", "model")
+    params = load_train_params(args.model_db)
+    model = group(params, "model")
     args.sam2_checkpoint = text(model, "sam2_checkpoint", args.sam2_checkpoint)
     args.sam2_cfg = text(model, "sam2_cfg", args.sam2_cfg)
     args.box_to_mask_prediction_enhancement_enabled = boolean(
@@ -154,7 +121,14 @@ def apply_dltool_config(args):
         floating(model, "prediction_iou_threshold", args.prediction_iou_threshold), 0.0, 1.0
     )
     args.prediction_min_vote_count = int(floating(model, "prediction_min_vote_count", args.prediction_min_vote_count))
-    return manifests
+    splits = []
+    for split_name in ("train", "validation"):
+        file_list = Path(args.dataset_dir) / f"{split_name}.txt"
+        if file_list.is_file():
+            splits.append((split_name, load_split_records(args.dataset_dir, split_name)))
+    if not splits:
+        raise FileNotFoundError("train file list not found")
+    return splits
 
 
 def setup_sam2_predictor(checkpoint_path, model_cfg, device):
@@ -229,16 +203,16 @@ def clamp_box(box, image_size):
     return np.array([x1, y1, x2, y2], dtype=np.float32)
 
 
-def default_mask_path(manifest_path, image, label):
+def default_mask_path(dataset_dir, image, label):
     image_id = str(image.get("id", Path(str(image.get("path", "image"))).stem)).strip() or "image"
     label_id = str(label.get("label_id", label.get("label_class_id", "label"))).strip() or "label"
-    masks_dir = Path(manifest_path).parent / "masks"
+    masks_dir = Path(dataset_dir) / "masks"
     return str(masks_dir / f"image_{image_id}_label_{label_id}.png")
 
 
-def collect_label_entries(manifest, manifest_path):
+def collect_label_entries(images, dataset_dir):
     entries = []
-    for image in manifest.get("images", []):
+    for image in images:
         if not isinstance(image, dict):
             continue
         image_path = str(image.get("path", "")).strip()
@@ -255,7 +229,7 @@ def collect_label_entries(manifest, manifest_path):
                 continue
             mask_path = str(label.get("mask_path", "")).strip()
             if not mask_path:
-                mask_path = default_mask_path(manifest_path, image, label)
+                mask_path = default_mask_path(dataset_dir, image, label)
                 label["mask_path"] = mask_path
             entries.append((image, label, image_path, mask_path, box))
     return entries
@@ -299,8 +273,8 @@ def _predict_augmented_box_mask(predictor, augmented_image, augmentation, box, i
     return predict_box_mask(predictor, augmented_box)
 
 
-def generate_masks(args, manifest, task_client, finish_on_complete=True):
-    entries = collect_label_entries(manifest, args.manifest)
+def generate_masks(args, images, task_client, finish_on_complete=True):
+    entries = collect_label_entries(images, args.dataset_dir)
     if not entries:
         if finish_on_complete:
             report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, 1, 1), 0, "无需处理的框")
@@ -348,8 +322,6 @@ def generate_masks(args, manifest, task_client, finish_on_complete=True):
         report_task_progress(task_client, args, done_progress, eta_seconds, f"已处理 {done}/{len(entries)}")
         print(f"Saved label mask: {output_path}")
 
-    output_manifest = args.output_manifest or args.manifest
-    save_manifest(output_manifest, manifest)
     if finish_on_complete:
         report_task_status(task_client, args, TaskStatus.FINISHED, task_progress(args, len(entries), len(entries)), 0,
                            f"BoxToMask 完成 ({len(entries)} 个标注)")
@@ -360,10 +332,16 @@ def generate_masks(args, manifest, task_client, finish_on_complete=True):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAM2 box-to-mask for FS-SAM2 custom manifest")
-    parser.add_argument("--config", type=str, default="", help="DLTool task config YAML")
-    parser.add_argument("--manifest", type=str, default="", help="FS-SAM2 custom manifest YAML")
-    parser.add_argument("--output_manifest", type=str, default="", help="Updated manifest path. Defaults to overwrite.")
+    parser = argparse.ArgumentParser(description="SAM2 box-to-mask for FS-SAM2 database dataset")
+    parser.add_argument("--model_db", type=str, default="")
+    parser.add_argument("--project_db", type=str, default="")
+    parser.add_argument("--model_root", type=str, default="")
+    parser.add_argument("--dataset_dir", type=str, default="")
+    parser.add_argument("--weight_dir", type=str, default="")
+    parser.add_argument("--log_dir", type=str, default="")
+    parser.add_argument("--model_uuid", type=str, default="")
+    parser.add_argument("--model_architecture", type=str, default="")
+    parser.add_argument("--method", type=int, default=-1)
     parser.add_argument("--sam2_checkpoint", type=str, default="", help="Path to SAM2 checkpoint")
     parser.add_argument("--sam2_cfg", type=str, default="", help="Path to SAM2 config YAML")
     parser.add_argument("--box_to_mask_prediction_enhancement_enabled", action="store_true", default=False)
@@ -386,11 +364,7 @@ def main():
     task_client = create_task_client(args)
     try:
         report_task_status(task_client, args, TaskStatus.RUNNING, args.dltool_progress_base, -1, "开始 SAM2 BoxToMask")
-        manifests = apply_dltool_config(args)
-        if not manifests:
-            if not args.manifest:
-                raise ValueError("manifest is empty")
-            manifests = [args.manifest]
+        splits = apply_database_config(args)
         if not args.sam2_checkpoint:
             raise ValueError("sam2_checkpoint is empty")
         if not args.sam2_cfg:
@@ -398,15 +372,12 @@ def main():
 
         original_base = args.dltool_progress_base
         original_span = args.dltool_progress_span
-        for index, manifest_path in enumerate(manifests):
-            split_base = original_base + original_span * index // max(1, len(manifests))
-            split_end = original_base + original_span * (index + 1) // max(1, len(manifests))
+        for index, (_split_name, images) in enumerate(splits):
+            split_base = original_base + original_span * index // max(1, len(splits))
+            split_end = original_base + original_span * (index + 1) // max(1, len(splits))
             args.dltool_progress_base = split_base
             args.dltool_progress_span = max(1, split_end - split_base)
-            args.manifest = manifest_path
-            args.output_manifest = manifest_path
-            manifest = load_manifest(args.manifest)
-            generate_masks(args, manifest, task_client, finish_on_complete=index == len(manifests) - 1)
+            generate_masks(args, images, task_client, finish_on_complete=index == len(splits) - 1)
         return 0
     except TaskStopRequested:
         return 130

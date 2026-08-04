@@ -9,7 +9,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import yaml
 from torch.utils.data import DataLoader
 
 from common.logger import Logger, AverageMeter
@@ -20,6 +19,12 @@ from data.dataset import FSSDataset
 TASK_DIR = Path(__file__).resolve().parents[2] / "task"
 if str(TASK_DIR) not in sys.path:
     sys.path.insert(0, str(TASK_DIR))
+
+FS_SAM2_DIR = Path(__file__).resolve().parent
+if str(FS_SAM2_DIR) not in sys.path:
+    sys.path.insert(0, str(FS_SAM2_DIR))
+
+from dltool_database import load_train_params
 
 from dltool_task_protocol import TaskStatus
 from dltool_task_reporting import (
@@ -91,12 +96,6 @@ def build_train_val_dataloaders(args):
 
 
 
-def load_config(path):
-    with open(path, 'r', encoding='utf-8') as handle:
-        loaded = yaml.safe_load(handle)
-    return loaded if isinstance(loaded, dict) else {}
-
-
 def group(values, *keys):
     current = values
     for key in keys:
@@ -125,28 +124,27 @@ def floating(values, name, default=0.0):
         return default
 
 
-def apply_dltool_config(args):
-    if not args.config:
-        return
+def apply_database_config(args):
+    if not args.model_db:
+        raise ValueError('model_db is empty')
+    if not args.dataset_dir:
+        raise ValueError('dataset_dir is empty')
 
-    config = load_config(args.config)
-    datasets = group(config, 'datasets')
-    train_dataset = group(datasets, 'train')
-    validation_dataset = group(datasets, 'validation')
-    train_manifest = text(train_dataset, 'manifest')
-    if not train_manifest:
-        raise ValueError('datasets.train.manifest is empty')
+    params = load_train_params(args.model_db)
+    train_file_list = Path(args.dataset_dir) / 'train.txt'
+    validation_file_list = Path(args.dataset_dir) / 'validation.txt'
+    if not train_file_list.is_file():
+        raise FileNotFoundError(f'train file list not found: {train_file_list}')
 
-    args.datapath = train_manifest
-    args.val_datapath = text(validation_dataset, 'manifest', train_manifest)
+    args.datapath = str(train_file_list)
+    args.val_datapath = str(validation_file_list if validation_file_list.is_file() else train_file_list)
     args.benchmark = 'custom'
-    args.exp_id = text(config, 'model_uuid', args.exp_id)
+    args.exp_id = args.model_uuid or args.exp_id
 
-    train_params = group(config, 'train_params')
-    training = group(train_params, 'training')
-    trainer = group(train_params, 'trainer')
-    network = group(train_params, 'network')
-    model = group(train_params, 'model')
+    training = group(params, 'training')
+    trainer = group(params, 'trainer')
+    network = group(params, 'network')
+    model = group(params, 'model')
 
     args.kshot = integer(training, 'kshot', args.kshot)
     args.epochs = integer(training, 'epochs', integer(trainer, 'max_epochs', args.epochs))
@@ -156,9 +154,8 @@ def apply_dltool_config(args):
     args.img_size = integer(network, 'image_size', integer(model, 'image_size', args.img_size))
     args.nworker = integer(training, 'num_workers', integer(model, 'num_workers', args.nworker))
 
-    log_root = text(config, 'weight_dir')
-    if log_root:
-        args.logpath = str(Path(log_root) / 'fs_sam2')
+    if args.weight_dir:
+        args.logpath = str(Path(args.weight_dir) / 'fs_sam2')
     args.sam2_checkpoint = text(model, 'sam2_checkpoint', args.sam2_checkpoint)
     args.sam2_cfg = text(model, 'sam2_cfg', args.sam2_cfg)
 
@@ -252,7 +249,15 @@ def main():
 
     # Arguments parsing
     parser = argparse.ArgumentParser(description='FS-SAM2 Pytorch Implementation')
-    parser.add_argument('--config', type=str, default='')
+    parser.add_argument('--model_db', type=str, default='')
+    parser.add_argument('--project_db', type=str, default='')
+    parser.add_argument('--model_root', type=str, default='')
+    parser.add_argument('--dataset_dir', type=str, default='')
+    parser.add_argument('--weight_dir', type=str, default='')
+    parser.add_argument('--log_dir', type=str, default='')
+    parser.add_argument('--model_uuid', type=str, default='')
+    parser.add_argument('--model_architecture', type=str, default='')
+    parser.add_argument('--method', type=int, default=-1)
     parser.add_argument('--datapath', type=str, default='../datasets/')  # CHANGE TO YOUR PATH
     parser.add_argument('--val_datapath', type=str, default='')
     parser.add_argument('--benchmark', type=str, default='pascal', choices=['pascal', 'coco', 'fss', 'custom'])
@@ -274,7 +279,7 @@ def main():
     parser.add_argument('--dltool_task_port', type=int, default=0)
     parser.add_argument('--dltool_task_id', type=int, default=-1)
     args = parser.parse_args()
-    apply_dltool_config(args)
+    apply_database_config(args)
 
     if args.logpath == '':  # if empty, autogenerate logpath from args
         args.logpath = f'{args.benchmark}/{args.exp_id}/fold{args.fold}'

@@ -1,12 +1,19 @@
 r""" Custom few-shot semantic segmentation dataset """
 import os
+import sys
+from pathlib import Path
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 import torch
 from torchvision import tv_tensors
 import PIL.Image as Image
 import numpy as np
-import yaml
+
+FS_SAM2_DIR = Path(__file__).resolve().parents[1]
+if str(FS_SAM2_DIR) not in sys.path:
+    sys.path.insert(0, str(FS_SAM2_DIR))
+
+from dltool_database import load_split_records
 
 
 class DatasetCustom(Dataset):
@@ -14,7 +21,7 @@ class DatasetCustom(Dataset):
         self.split = split
         self.shot = shot
         self.benchmark = 'custom'
-        self.manifest_path = datapath
+        self.file_list_path = datapath
         self.transform = transform
         self.img_size = img_size
         self.use_original_imgsize = use_original_imgsize
@@ -24,13 +31,13 @@ class DatasetCustom(Dataset):
         self.entries_by_class = self._load_entries(datapath)
         self.all_classes = sorted(self.entries_by_class.keys())
         if not self.all_classes:
-            raise RuntimeError(f'No labeled classes found in manifest: {datapath}')
+            raise RuntimeError(f'No labeled classes found in dataset split: {datapath}')
         self.nclass = len(self.all_classes)
         self.classes = self.all_classes[:]
         self.class_ids = list(range(len(self.classes)))
         self.img_metadata = self.build_img_metadata()
         if not self.img_metadata:
-            raise RuntimeError(f'No usable images found in manifest: {datapath}')
+            raise RuntimeError(f'No usable images found in dataset split: {datapath}')
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -107,10 +114,9 @@ class DatasetCustom(Dataset):
             metadata.extend(entries)
         return metadata
 
-    def _load_entries(self, manifest_path):
-        with open(manifest_path, 'r', encoding='utf-8') as handle:
-            manifest = yaml.safe_load(handle) or {}
-        images = manifest.get('images', [])
+    def _load_entries(self, file_list_path):
+        split = Path(file_list_path).stem
+        images = load_split_records(Path(file_list_path).parent, split)
         entries_by_class = {}
         for image in images:
             image_path = str(image.get('path', '')).strip()
@@ -118,7 +124,10 @@ class DatasetCustom(Dataset):
                 continue
             masks_by_class = {}
             for label in image.get('labels', []) or []:
-                class_id = int(label.get('label_class_id', -1))
+                try:
+                    class_id = int(label.get('label_class_id', -1))
+                except (TypeError, ValueError):
+                    class_id = -1
                 class_name = str(label.get('label_class_name') or class_id)
                 mask_path = str(label.get('mask_path', '')).strip()
                 if class_id < 0:
