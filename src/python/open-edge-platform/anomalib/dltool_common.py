@@ -1,7 +1,7 @@
 import argparse
-import argparse
 import csv
 import json
+import math
 import sys
 import sqlite3
 import time
@@ -33,6 +33,8 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project_db", default="")
     parser.add_argument("--model_root", default="")
     parser.add_argument("--dataset_dir", required=True)
+    parser.add_argument("--train_dir", default="")
+    parser.add_argument("--masks_dir", default="")
     parser.add_argument("--test_file_list", default="")
     parser.add_argument("--weight_dir", default="")
     parser.add_argument("--log_dir", default="")
@@ -92,19 +94,21 @@ def load_database_config(args: argparse.Namespace, section: str) -> dict[str, An
     }
 
     dataset_root = Path(args.dataset_dir)
-    for split in ("train", "validation", "test"):
-        file_list = (
-            Path(args.test_file_list)
-            if split == "test" and args.test_file_list
-            else dataset_root / "test.txt"
-            if split == "test"
-            else dataset_root / f"{split}.txt"
-        )
-        if file_list.is_file():
+    masks_dir = Path(args.masks_dir) if args.masks_dir else dataset_root / "masks"
+    train_dir = Path(args.train_dir) if args.train_dir else dataset_root.parent / "train"
+    for split in ("train", "validation"):
+        split_file = train_dir / f"{split}.txt"
+        if split_file.is_file():
             config["datasets"][split] = {
-                "file_list": str(file_list),
-                "masks_dir": str(dataset_root / "masks"),
+                "file_list": str(split_file),
+                "masks_dir": str(masks_dir),
             }
+    test_file_list = Path(args.test_file_list) if args.test_file_list else dataset_root / "test.txt"
+    if test_file_list.is_file():
+        config["datasets"]["test"] = {
+            "file_list": str(test_file_list),
+            "masks_dir": str(masks_dir),
+        }
 
     if section == "test_params":
         inference = dict(group(config, "test_params", "inference"))
@@ -336,12 +340,13 @@ def dataset_masks_dir(config: dict[str, Any], split: str) -> str:
     return text(dataset_entry(config, split), "masks_dir")
 
 
-def load_file_list(path: str | Path, load_labels: bool = True) -> dict[str, Any]:
+def load_file_list(path: str | Path) -> dict[str, Any]:
+    """Load one exported CSV image list (used for the test split)."""
     list_path = Path(path)
     if not list_path.is_file():
         raise FileNotFoundError(f"dataset file list not found: {list_path}")
 
-    rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
     with list_path.open("r", encoding="utf-8", newline="") as handle:
         for row in csv.reader(handle):
             if not row or row[0].strip().lower() == "image_id" or len(row) < 2:
@@ -349,36 +354,10 @@ def load_file_list(path: str | Path, load_labels: bool = True) -> dict[str, Any]
             image_id = row[0].strip()
             image_path = row[1].strip()
             if image_id and image_path:
-                rows.append({"id": image_id, "path": image_path})
-
-    loaded: Any = {}
-    labels_path = list_path.with_name(f"{list_path.stem}_labels.json")
-    if load_labels and labels_path.is_file():
-        with labels_path.open("r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    if isinstance(loaded, list):
-        label_items = loaded
-        masks_dir = ""
-    elif isinstance(loaded, dict):
-        label_items = loaded.get("samples", [])
-        masks_dir = str(loaded.get("masks_dir", ""))
-    else:
-        raise ValueError(f"dataset label file is invalid: {labels_path}")
-
-    by_id = {
-        str(item.get("id", "")).strip(): dict(item)
-        for item in label_items
-        if isinstance(item, dict) and str(item.get("id", "")).strip()
-    }
-    samples: list[dict[str, Any]] = []
-    for row in rows:
-        sample = by_id.get(row["id"], {})
-        sample["id"] = row["id"]
-        sample["path"] = row["path"]
-        samples.append(sample)
+                samples.append({"id": image_id, "path": image_path})
     if not samples:
         raise ValueError(f"dataset file list has no usable images: {list_path}")
-    return {"samples": samples, "masks_dir": masks_dir}
+    return {"samples": samples}
 
 
 def dltool_file_list_samples(
@@ -394,13 +373,11 @@ def dltool_file_list_samples(
             raise ValueError(f"datasets.{dataset_split}.file_list is empty")
         return []
 
+    masks_dir = dataset_masks_dir(config, dataset_split)
     # Test labels are deliberately not exported.  Ground truth is rebuilt by
     # the C++ evaluator from task.db and the project database.
-    file_list = load_file_list(file_list_path, load_labels=dataset_split != "test")
-    masks_dir = dataset_masks_dir(config, dataset_split) or text(file_list, "masks_dir")
+    file_list = load_file_list(file_list_path)
     samples = file_list.get("samples", [])
-    if not isinstance(samples, list):
-        raise ValueError(f"dataset file list samples is not a list: {file_list_path}")
 
     result: list[dict[str, Any]] = []
     for sample in samples:
@@ -408,14 +385,21 @@ def dltool_file_list_samples(
             continue
         image_id = text(sample, "id")
         image_path = text(sample, "path")
-        if not image_path:
+        if not image_id or not image_path:
             continue
-        label_index = integer(sample, "label_index", 0)
+        if dataset_split == "test":
+            label_index = integer(sample, "label_index", 0)
+            mask_name = text(sample, "mask")
+            mask_path = str(Path(masks_dir) / mask_name) if mask_name and masks_dir else ""
+        else:
+            # 异常由掩膜是否存在决定：找到 {image_id}.png 即为异常图，否则为正常图。
+            # 掩膜像素 0 表示背景，255 表示异常区域。
+            mask_path = str(Path(masks_dir) / f"{image_id}.png") if masks_dir else ""
+            if mask_path and not Path(mask_path).is_file():
+                mask_path = ""
+            label_index = 1 if mask_path else 0
         if normal_only and label_index != 0:
             continue
-
-        mask_name = text(sample, "mask")
-        mask_path = str(Path(masks_dir) / mask_name) if mask_name and masks_dir else ""
         result.append(
             {
                 "id": image_id,
