@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from dltool_common import (
     DltoolProgressCallback,
@@ -16,6 +17,7 @@ from dltool_common import (
     report_failure,
     report_result,
     status,
+    text,
 )
 
 
@@ -41,6 +43,15 @@ def main() -> int:
         engine = build_engine(config, "train_params", progress.callback)
         engine.fit(model=model, datamodule=datamodule)
         results = engine.test(model=model, datamodule=datamodule)
+
+        # A configured checkpoint interval may not hit the final epoch, so
+        # always persist the finished model at the weights directory.  The
+        # test pipeline reads model.ckpt from this directory.
+        weight_dir = text(config, "weight_dir")
+        if weight_dir:
+            checkpoint_dir = Path(weight_dir)
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            engine.trainer.save_checkpoint(str(checkpoint_dir / "model.ckpt"))
 
         best_model_path = engine.best_model_path or ""
         message = f"训练完成: {best_model_path}" if best_model_path else "训练完成"

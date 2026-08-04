@@ -206,7 +206,7 @@ def clamp_box(box, image_size):
 def default_mask_path(dataset_dir, image, label):
     image_id = str(image.get("id", Path(str(image.get("path", "image"))).stem)).strip() or "image"
     label_id = str(label.get("label_id", label.get("label_class_id", "label"))).strip() or "label"
-    masks_dir = Path(dataset_dir) / "masks"
+    masks_dir = Path(dataset_dir)
     return str(masks_dir / f"image_{image_id}_label_{label_id}.png")
 
 

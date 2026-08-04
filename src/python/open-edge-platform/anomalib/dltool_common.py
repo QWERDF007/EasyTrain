@@ -94,7 +94,7 @@ def load_database_config(args: argparse.Namespace, section: str) -> dict[str, An
     }
 
     dataset_root = Path(args.dataset_dir)
-    masks_dir = Path(args.masks_dir) if args.masks_dir else dataset_root / "masks"
+    masks_dir = Path(args.masks_dir) if args.masks_dir else dataset_root
     train_dir = Path(args.train_dir) if args.train_dir else dataset_root.parent / "train"
     for split in ("train", "validation"):
         split_file = train_dir / f"{split}.txt"
@@ -311,7 +311,26 @@ class DltoolCustomDataModule:
             def val_dataloader(self):
                 if not self._validation_samples:
                     return None
-                return super().val_dataloader()
+                from torch.utils.data import DataLoader
+                return DataLoader(
+                    dataset=self.val_data,
+                    shuffle=False,
+                    batch_size=self.eval_batch_size,
+                    num_workers=self.num_workers,
+                    collate_fn=self.external_collate_fn or self.val_data.collate_fn,
+                    persistent_workers=self.num_workers > 0,
+                )
+
+            def train_dataloader(self):
+                from torch.utils.data import DataLoader
+                return DataLoader(
+                    dataset=self.train_data,
+                    shuffle=True,
+                    batch_size=self.train_batch_size,
+                    num_workers=self.num_workers,
+                    collate_fn=self.external_collate_fn or self.train_data.collate_fn,
+                    persistent_workers=self.num_workers > 0,
+                )
 
             def _create_test_split(self) -> None:
                 return
@@ -415,6 +434,46 @@ def dltool_file_list_samples(
     return result
 
 
+from anomalib.metrics import Evaluator  # noqa: E402
+
+
+class DltoolEvaluator(Evaluator):
+    """Evaluator that routes metric logging to the Lightning module.
+
+    ``anomalib.metrics.Evaluator`` calls ``self.log(...)`` in its epoch-end
+    hooks, but the base class does not define ``log``.  Route the call to the
+    Lightning module so validation/test metrics are actually written to
+    TensorBoard instead of raising ``AttributeError``.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._log_module = None
+    def setup(self, trainer, pl_module, stage) -> None:
+        super().setup(trainer, pl_module, stage)
+        self._log_module = pl_module
+
+    def log(self, name: str, value: Any, **kwargs: Any) -> None:
+        if self._log_module is not None:
+            self._log_module.log(name, value, **kwargs)
+
+
+def default_validation_metrics() -> list:
+    """Validation metrics for anomaly detection models.
+
+    Mirrors the image/pixel AUROC and F1Score set used for testing, so
+    validation results are computed and written to TensorBoard.
+    """
+    from anomalib.metrics import AUROC, F1Score
+
+    return [
+        AUROC(fields=["pred_score", "gt_label"], prefix="image_"),
+        F1Score(fields=["pred_label", "gt_label"], prefix="image_"),
+        AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_", strict=False),
+        F1Score(fields=["pred_mask", "gt_mask"], prefix="pixel_", strict=False),
+    ]
+
+
 def build_model(
     config: dict[str, Any],
     section: str = "train_params",
@@ -450,12 +509,17 @@ def build_model(
             ),
             precision=text(training_params, "precision", text(model_params, "precision", "float32")),
             pre_processor=pre_processor,
+            evaluator=DltoolEvaluator(
+                val_metrics=default_validation_metrics(),
+                test_metrics=list(Patchcore.configure_evaluator().test_metrics),
+                compute_on_cpu=True,
+            ),
             visualizer=visualizer,
         )
 
     if architecture == "dinomaly2":
         from anomalib.models import Dinomaly
-        from anomalib.metrics import AUPRO, Evaluator
+        from anomalib.metrics import AUPRO
 
         if integer(model_params, "image_channels", 3) != 3:
             raise ValueError("Dinomaly currently supports RGB images with 3 channels only")
@@ -464,8 +528,8 @@ def build_model(
             crop_size=integer(model_params, "crop_size", 392),
         )
         default_evaluator = Dinomaly.configure_evaluator()
-        evaluator = Evaluator(
-            val_metrics=list(default_evaluator.val_metrics),
+        evaluator = DltoolEvaluator(
+            val_metrics=default_validation_metrics(),
             test_metrics=[
                 *list(default_evaluator.test_metrics),
                 AUPRO(fields=["anomaly_map", "gt_mask"], prefix="pixel_", strict=False),
@@ -536,6 +600,14 @@ def build_engine(config: dict[str, Any], section: str, callback):
                 weight_dir = str(Path(output_dir).parent / "weights")
         # Keep the trainer workspace out of results during training as well.
         default_root_dir = weight_dir
+        # The checkpoint interval only applies when the model configuration
+        # defines it.  Memory-based methods such as PatchCore finish in a
+        # single epoch and must keep saving at every epoch end by default.
+        checkpoint_kwargs: dict[str, Any] = {}
+        if "checkpoint_every_n_epoch" in runtime_params:
+            checkpoint_kwargs["every_n_epochs"] = max(
+                1, integer(runtime_params, "checkpoint_every_n_epoch", 5)
+            )
         callbacks.insert(
             0,
             ModelCheckpoint(
@@ -545,6 +617,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
                 save_top_k=1,
                 save_last=False,
                 enable_version_counter=False,
+                **checkpoint_kwargs,
             ),
         )
     kwargs: dict[str, Any] = {
@@ -561,6 +634,10 @@ def build_engine(config: dict[str, Any], section: str, callback):
         kwargs["max_epochs"] = max_epochs
     if max_steps > 0:
         kwargs["max_steps"] = max_steps
+    if "check_val_every_n_epoch" in runtime_params:
+        kwargs["check_val_every_n_epoch"] = max(
+            1, integer(runtime_params, "check_val_every_n_epoch", 5)
+        )
     return Engine(**kwargs)
 
 
