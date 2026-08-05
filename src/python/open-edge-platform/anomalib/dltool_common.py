@@ -5,6 +5,7 @@ import math
 import sys
 import sqlite3
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -451,11 +452,15 @@ class DltoolEvaluator(Evaluator):
         self._log_module = None
     def setup(self, trainer, pl_module, stage) -> None:
         super().setup(trainer, pl_module, stage)
-        self._log_module = pl_module
+        # 只保存弱引用：直接赋值 Lightning 模块会被 nn.Module.__setattr__
+        # 注册为子模块，形成 model -> evaluator -> model 的模块树循环，
+        # 使 load_state_dict/.cpu() 等递归遍历无限递归直至爆栈。
+        self._log_module = weakref.ref(pl_module)
 
     def log(self, name: str, value: Any, **kwargs: Any) -> None:
-        if self._log_module is not None:
-            self._log_module.log(name, value, **kwargs)
+        module = self._log_module() if self._log_module is not None else None
+        if module is not None:
+            module.log(name, value, **kwargs)
 
 
 def default_validation_metrics() -> list:
