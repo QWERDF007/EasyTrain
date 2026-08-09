@@ -457,6 +457,23 @@ class DltoolEvaluator(Evaluator):
         # 使 load_state_dict/.cpu() 等递归遍历无限递归直至爆栈。
         self._log_module = weakref.ref(pl_module)
 
+    def __getstate__(self) -> dict:
+        # 弱引用不可 pickle。checkpoint 保存时会 pickle 整个模块（含
+        # save_hyperparameters 捕获的 evaluator 对象），这里把弱引用从
+        # 序列化状态中排除，恢复后由 Lightning 重新触发 setup 重建。
+        getstate = getattr(super(), "__getstate__", None)
+        state = getstate() if callable(getstate) else self.__dict__.copy()
+        state.pop("_log_module", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        setstate = getattr(super(), "__setstate__", None)
+        if callable(setstate):
+            setstate(state)
+        else:
+            self.__dict__.update(state)
+        self._log_module = None
+
     def log(self, name: str, value: Any, **kwargs: Any) -> None:
         module = self._log_module() if self._log_module is not None else None
         if module is not None:
@@ -466,16 +483,16 @@ class DltoolEvaluator(Evaluator):
 def default_validation_metrics() -> list:
     """Validation metrics for anomaly detection models.
 
-    Mirrors the image/pixel AUROC and F1Score set used for testing, so
-    validation results are computed and written to TensorBoard.
+    Validation runs before post-processing thresholds are finalized, so only
+    metrics based on the raw anomaly scores and maps are available here. F1
+    metrics are configured for testing, after post-processing has generated
+    ``pred_label`` and ``pred_mask``.
     """
-    from anomalib.metrics import AUROC, F1Score
+    from anomalib.metrics import AUROC
 
     return [
         AUROC(fields=["pred_score", "gt_label"], prefix="image_"),
-        F1Score(fields=["pred_label", "gt_label"], prefix="image_"),
         AUROC(fields=["anomaly_map", "gt_mask"], prefix="pixel_", strict=False),
-        F1Score(fields=["pred_mask", "gt_mask"], prefix="pixel_", strict=False),
     ]
 
 
