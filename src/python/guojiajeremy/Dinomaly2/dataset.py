@@ -52,6 +52,89 @@ def get_strong_transforms(size, isize, mean_train=None, std_train=None):
     return data_transforms
 
 
+class MaskConstraintTrainTransform:
+    """Training transform with mask-safe horizontal flipping.
+
+    Horizontal flipping is applied to the image and its optional mask using
+    the same random decision. ColorJitter is applied only to the image. No
+    other geometric augmentation is performed here.
+    """
+
+    def __init__(
+        self,
+        size,
+        isize,
+        hflip_prob=0.5,
+        brightness=0.2,
+        contrast=0.2,
+        hue=0.1,
+        mean_train=None,
+        std_train=None,
+    ):
+        if not 0.0 <= hflip_prob <= 1.0:
+            raise ValueError("hflip_prob must be in [0, 1].")
+        if brightness < 0 or contrast < 0:
+            raise ValueError("brightness and contrast must be non-negative.")
+        if not 0.0 <= hue <= 0.5:
+            raise ValueError("hue must be in [0, 0.5].")
+
+        mean_train = [0.485, 0.456, 0.406] if mean_train is None else mean_train
+        std_train = [0.229, 0.224, 0.225] if std_train is None else std_train
+        self.hflip_prob = hflip_prob
+        self.image_transform = transforms.Compose([
+            transforms.Resize((size, size)),
+            transforms.ColorJitter(
+                brightness=brightness,
+                contrast=contrast,
+                hue=hue,
+            ),
+            transforms.ToTensor(),
+            transforms.CenterCrop(isize),
+            transforms.Normalize(mean=mean_train, std=std_train),
+        ])
+        self.mask_resize = transforms.Resize(
+            (size, size),
+            interpolation=transforms.InterpolationMode.NEAREST,
+        )
+        self.mask_crop = transforms.CenterCrop(isize)
+
+    def __call__(self, image, mask=None):
+        if self.hflip_prob > 0 and random.random() < self.hflip_prob:
+            image = F.hflip(image)
+            if mask is not None:
+                mask = F.hflip(mask)
+
+        image = self.image_transform(image)
+        if mask is not None:
+            mask = self.mask_resize(mask)
+            mask = self.mask_crop(mask)
+        return image, mask
+
+
+def get_mask_constraint_train_transform(
+    size,
+    isize,
+    hflip_prob=0.5,
+    brightness=0.2,
+    contrast=0.2,
+    hue=0.1,
+    mean_train=None,
+    std_train=None,
+):
+    """Build the mask-aware transform used only for mask training images."""
+
+    return MaskConstraintTrainTransform(
+        size=size,
+        isize=isize,
+        hflip_prob=hflip_prob,
+        brightness=brightness,
+        contrast=contrast,
+        hue=hue,
+        mean_train=mean_train,
+        std_train=std_train,
+    )
+
+
 class RandomRotate90(object):
     def __call__(self, img):
         angle = random.choice([0, 90, 180, 270])
