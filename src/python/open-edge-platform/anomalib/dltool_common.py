@@ -26,6 +26,24 @@ from dltool_task_reporting import (  # noqa: E402
     report_result,
     report_status as status,
 )
+from dltool_task_utils import (  # noqa: E402
+    batch_count,
+    boolean,
+    dataloader_batch_count,
+    floating,
+    format_hms,
+    format_number,
+    integer,
+    is_character_sequence,
+    load_params_table,
+    metric_value,
+    optional_text,
+    scalar,
+    should_stop,
+    square_size,
+    string_list,
+    text,
+)
 
 
 def add_task_arguments(parser: argparse.ArgumentParser) -> None:
@@ -48,38 +66,10 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dltool_task_id", type=int, default=-1)
 
 
-def _insert_value(target: dict[str, Any], name: str, value: Any) -> None:
-    parts = [part for part in str(name).split(".") if part]
-    current = target
-    for part in parts[:-1]:
-        child = current.get(part)
-        if not isinstance(child, dict):
-            child = {}
-            current[part] = child
-        current = child
-    if parts:
-        current[parts[-1]] = value
-
-
-def _load_params(database_path: str | Path, table: str) -> dict[str, Any]:
-    path = Path(database_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"database not found: {path}")
-    if table not in {"train_params", "test_params"}:
-        raise ValueError(f"unsupported parameter table: {table}")
-
-    result: dict[str, Any] = {}
-    with sqlite3.connect(path) as connection:
-        rows = connection.execute(f"SELECT name_en, value FROM {table} ORDER BY name_en").fetchall()
-    for name, encoded in rows:
-        _insert_value(result, str(name), json.loads(encoded))
-    return result
-
-
 def load_database_config(args: argparse.Namespace, section: str) -> dict[str, Any]:
     """Build the runner view from model.db/task.db and the model file lists."""
-    train_params = _load_params(args.model_db, "train_params")
-    test_params = _load_params(args.task_db, "test_params") if args.task_db else {}
+    train_params = load_params_table(args.model_db, "train_params")
+    test_params = load_params_table(args.task_db, "test_params") if args.task_db else {}
     config: dict[str, Any] = {
         "model_uuid": args.model_uuid,
         "model_architecture": args.model_architecture,
@@ -115,113 +105,20 @@ def load_database_config(args: argparse.Namespace, section: str) -> dict[str, An
         inference = dict(group(config, "test_params", "inference"))
         if args.prediction_dir:
             inference["output_dir"] = args.prediction_dir
-        checkpoint = text(inference, "checkpoint_path")
+        checkpoint = text(inference, "checkpoint")
         if checkpoint and not Path(checkpoint).is_absolute():
             candidates = [Path(args.model_root) / checkpoint, Path(args.weight_dir) / checkpoint]
             checkpoint = str(next((candidate for candidate in candidates if candidate.is_file()), candidates[-1]))
-            inference["checkpoint_path"] = checkpoint
+        if checkpoint:
+            inference["checkpoint"] = checkpoint
         config["test_params"]["inference"] = inference
     return config
-
-
 def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
     section_values = config.get(section, {})
     if not isinstance(section_values, dict):
         return {}
     value = section_values.get(name, {})
     return value if isinstance(value, dict) else {}
-
-
-def is_character_sequence(value: Any) -> bool:
-    return isinstance(value, list) and bool(value) and all(len(str(item)) == 1 for item in value)
-
-
-def scalar(value: Any, default: str = "") -> Any:
-    if value is None:
-        return default
-    if is_character_sequence(value):
-        return "".join(str(item) for item in value)
-    return value
-
-
-def text(values: dict[str, Any], name: str, default: str = "") -> str:
-    value = scalar(values.get(name, default), default)
-    return default if value is None else str(value).strip()
-
-
-def optional_text(values: dict[str, Any], name: str) -> str | None:
-    value = text(values, name)
-    return value or None
-
-
-def integer(values: dict[str, Any], name: str, default: int = 0) -> int:
-    try:
-        return int(scalar(values.get(name, default), str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def floating(values: dict[str, Any], name: str, default: float = 0.0) -> float:
-    try:
-        return float(scalar(values.get(name, default), str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def boolean(values: dict[str, Any], name: str, default: bool = False) -> bool:
-    value = scalar(values.get(name, default), str(default))
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def string_list(values: dict[str, Any], name: str, default: list[str] | None = None) -> list[str]:
-    fallback = list(default or [])
-    if not isinstance(values, dict) or name not in values or values.get(name) is None:
-        return fallback
-
-    value = scalar(values.get(name))
-    if isinstance(value, list):
-        result = [str(item).strip() for item in value if str(item).strip()]
-        return result or fallback
-    if isinstance(value, str):
-        result = [item.strip() for item in value.split(",") if item.strip()]
-        return result or fallback
-    return fallback
-
-
-def square_size(values: dict[str, Any], name: str, default: int) -> tuple[int, int]:
-    size = integer(values, name, default)
-    return size, size
-
-
-def batch_count(value: Any) -> int:
-    if isinstance(value, (list, tuple)):
-        total = 0
-        for item in value:
-            try:
-                total += max(0, int(item))
-            except (TypeError, ValueError, OverflowError):
-                continue
-        return total
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def dataloader_batch_count(value: Any) -> int:
-    try:
-        loader = value() if callable(value) else value
-        return batch_count(len(loader))
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        return 0
-
-
-
-
-def should_stop(client: TaskClient | None, task_id: int) -> bool:
-    return client is not None and client.should_stop(task_id)
 
 
 def build_datamodule(config: dict[str, Any], section: str):
@@ -663,26 +560,6 @@ def build_engine(config: dict[str, Any], section: str, callback):
     return Engine(**kwargs)
 
 
-def metric_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): metric_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [metric_value(item) for item in value]
-    try:
-        if hasattr(value, "detach"):
-            value = value.detach().cpu()
-        if hasattr(value, "item"):
-            value = value.item()
-    except Exception:
-        pass
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return str(value)
-
-
 def metrics_payload(results: Any) -> dict[str, Any]:
     if isinstance(results, list):
         merged: dict[str, Any] = {}
@@ -698,28 +575,6 @@ def metrics_payload(results: Any) -> dict[str, Any]:
 def metrics_text(results: Any) -> str:
     values = metrics_payload(results)
     return "\n".join(f"{key}: {value}" for key, value in values.items())
-
-
-def status_value_text(value: Any, digits: int = 6) -> str:
-    normalized = metric_value(value)
-    if normalized is None:
-        return "-"
-    if isinstance(normalized, float):
-        return f"{normalized:.{digits}f}"
-    return str(normalized)
-
-
-def elapsed_text(seconds: Any) -> str:
-    try:
-        value = float(seconds)
-    except (TypeError, ValueError, OverflowError):
-        return "-"
-    if value < 0:
-        return "-"
-    total = max(0, int(round(value)))
-    hours, remainder = divmod(total, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 class DltoolProgressCallback:
@@ -1010,10 +865,10 @@ class DltoolProgressCallback:
             "phase_progress": self.last_phase_progress,
             "epoch": f"{self.last_epoch_current} / {self.epoch_total}",
             "iter": f"{self.last_iter_current} / {self.iter_total}",
-            "lr": status_value_text(self.last_lr),
-            "loss": status_value_text(self.last_loss),
-            "elapsed": elapsed_text(time.monotonic() - self.fit_start_time),
-            "eta": elapsed_text(eta_seconds),
+            "lr": format_number(self.last_lr),
+            "loss": format_number(self.last_loss),
+            "elapsed": format_hms(time.monotonic() - self.fit_start_time),
+            "eta": format_hms(eta_seconds),
         }
         return payload
 
@@ -1090,3 +945,5 @@ class DltoolProgressCallback:
         if should_stop(self.client, self.task_id):
             status(self.client, self.task_id, TaskStatus.STOPPED, -1, -1, "任务已停止")
             raise TaskStopRequested()
+
+

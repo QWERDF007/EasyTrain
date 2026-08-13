@@ -56,7 +56,7 @@ def main() -> int:
 
         config = load_database_config(args, "test_params")
         inference = group(config, "test_params", "inference")
-        checkpoint = text(inference, "checkpoint_path")
+        checkpoint = text(inference, "checkpoint")
         if not checkpoint:
             weight_dir = text(config, "weight_dir")
             if weight_dir:
@@ -170,3 +170,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

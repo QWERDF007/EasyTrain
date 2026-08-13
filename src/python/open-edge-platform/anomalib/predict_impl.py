@@ -149,7 +149,7 @@ def main() -> int:
     try:
         config = load_database_config(args, "test_params")
         inference = group(config, "test_params", "inference")
-        checkpoint_path = text(inference, "checkpoint_path")
+        checkpoint_path = text(inference, "checkpoint")
         if not checkpoint_path:
             weight_dir = text(config, "weight_dir")
             if weight_dir:
@@ -187,3 +187,4 @@ def main() -> int:
     finally:
         if client is not None:
             client.close()
+

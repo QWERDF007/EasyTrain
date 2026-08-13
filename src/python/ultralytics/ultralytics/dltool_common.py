@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
-TASK_DIR = ROOT.parent / "task"
-PACKAGE_ROOT = ROOT / "ultralytics"
-for path in (ROOT, TASK_DIR, PACKAGE_ROOT):
+FRAMEWORK_ROOT = ROOT.parent
+TASK_DIR = ROOT.parents[1] / "task"
+for path in (ROOT, FRAMEWORK_ROOT, TASK_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -25,6 +23,17 @@ from dltool_task_reporting import (  # noqa: E402
     report_progress,
     report_result,
     report_status,
+)
+from dltool_task_utils import (  # noqa: E402
+    boolean,
+    estimate_eta,
+    floating,
+    format_hms,
+    format_number,
+    integer,
+    load_params_table as load_params,
+    scalar,
+    text,
 )
 
 
@@ -48,70 +57,9 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dltool_task_id", type=int, default=-1)
 
 
-def _insert_value(target: dict[str, Any], name: str, value: Any) -> None:
-    parts = [part for part in str(name).split(".") if part]
-    current = target
-    for part in parts[:-1]:
-        child = current.get(part)
-        if not isinstance(child, dict):
-            child = {}
-            current[part] = child
-        current = child
-    if parts:
-        current[parts[-1]] = value
-
-
-def load_params(database_path: str | Path, table: str) -> dict[str, Any]:
-    path = Path(database_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"database not found: {path}")
-    if table not in {"train_params", "test_params"}:
-        raise ValueError(f"unsupported parameter table: {table}")
-    result: dict[str, Any] = {}
-    with sqlite3.connect(path) as connection:
-        rows = connection.execute(f"SELECT name_en, value FROM {table} ORDER BY name_en").fetchall()
-    for name, encoded in rows:
-        _insert_value(result, str(name), json.loads(encoded))
-    return result
-
-
 def group(values: dict[str, Any], name: str) -> dict[str, Any]:
     value = values.get(name, {})
     return value if isinstance(value, dict) else {}
-
-
-def scalar(value: Any, default: Any = None) -> Any:
-    if value is None:
-        return default
-    if isinstance(value, list) and value and all(len(str(item)) == 1 for item in value):
-        return "".join(str(item) for item in value)
-    return value
-
-
-def text(values: dict[str, Any], name: str, default: str = "") -> str:
-    value = scalar(values.get(name, default), default)
-    return default if value is None else str(value).strip()
-
-
-def integer(values: dict[str, Any], name: str, default: int = 0) -> int:
-    try:
-        return int(scalar(values.get(name, default), default))
-    except (TypeError, ValueError):
-        return default
-
-
-def floating(values: dict[str, Any], name: str, default: float = 0.0) -> float:
-    try:
-        return float(scalar(values.get(name, default), default))
-    except (TypeError, ValueError):
-        return default
-
-
-def boolean(values: dict[str, Any], name: str, default: bool = False) -> bool:
-    value = scalar(values.get(name, default), default)
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_dataset_yaml(dataset_dir: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -124,30 +72,6 @@ def load_dataset_yaml(dataset_dir: str | Path) -> tuple[Path, dict[str, Any]]:
     if not isinstance(data, dict):
         raise ValueError(f"invalid Ultralytics dataset configuration: {path}")
     return path, data
-
-
-def resolve_model_source(args: argparse.Namespace, train_values: dict[str, Any] | None = None) -> str:
-    network = group(train_values or {}, "network")
-    configured = text(network, "model_path") or text(network, "checkpoint_path")
-    if configured:
-        candidate = Path(configured)
-        if not candidate.is_absolute():
-            candidate = Path(args.model_root) / candidate
-        if candidate.is_file():
-            return str(candidate)
-
-    architecture = args.model_architecture.strip().lower()
-    pretrained = text(network, "pretrained", "COCO").lower()
-    if pretrained == "none":
-        model_name = "yolov8-seg.yaml" if "seg" in architecture else "yolov8.yaml"
-        if "yolov5" in architecture:
-            model_name = "yolov5.yaml"
-        return str(PACKAGE_ROOT / "ultralytics" / "cfg" / "models" / ("v5" if "yolov5" in architecture else "v8") / model_name)
-    if "seg" in architecture:
-        return "yolov8n-seg.pt"
-    if "yolov5" in architecture:
-        return "yolov5n.pt"
-    return "yolov8n.pt"
 
 
 def model_task(architecture: str) -> str:
@@ -193,8 +117,8 @@ __all__ = [
     "report_log",
     "report_progress",
     "report_result",
-    "resolve_model_source",
     "test_params",
     "text",
     "train_params",
 ]
+

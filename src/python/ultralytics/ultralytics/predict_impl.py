@@ -13,18 +13,14 @@ from dltool_common import (
     TaskStatus,
     add_task_arguments,
     create_task_client,
-    floating,
     group,
+    load_dataset_yaml,
     model_task,
     publish_status,
     report_failure,
     report_result,
-    resolve_model_source,
     test_params,
     text,
-    train_params,
-    integer,
-    load_dataset_yaml,
 )
 
 
@@ -135,7 +131,6 @@ def main() -> int:
     args = parser.parse_args()
     client = create_task_client(args)
     try:
-        train_values = train_params(args)
         test_values = test_params(args)
         inference = group(test_values, "inference")
         records = read_test_records(args.test_file_list)
@@ -144,27 +139,36 @@ def main() -> int:
             int(key): int(value)
             for key, value in (dataset_config.get("class_ids", {}) or {}).items()
         }
-        checkpoint = text(inference, "checkpoint_path")
-        if checkpoint and not Path(checkpoint).is_absolute():
-            checkpoint = str(Path(args.model_root) / checkpoint)
-        if not checkpoint or not Path(checkpoint).is_file():
-            checkpoint = str(Path(args.weight_dir) / "model.pt")
-        if not Path(checkpoint).is_file():
-            checkpoint = resolve_model_source(args, train_values)
+        checkpoint = text(inference, "checkpoint")
+        if checkpoint:
+            candidate = Path(checkpoint)
+            if not candidate.is_absolute():
+                candidate = Path(args.model_root) / candidate
+            if candidate.is_file():
+                checkpoint = str(candidate)
+            elif Path(checkpoint).is_file():
+                checkpoint = str(Path(checkpoint))
+        if not checkpoint:
+            for candidate in (Path(args.weight_dir) / "best.pt", Path(args.weight_dir) / "last.pt"):
+                if candidate.is_file():
+                    checkpoint = str(candidate)
+                    break
+        if not checkpoint:
+            raise ValueError("inference.checkpoint is empty and no trained weights found")
 
         from ultralytics import YOLO
 
         task = model_task(args.model_architecture)
         model = YOLO(checkpoint, task=task, verbose=False)
-        publish_status(client, args, TaskStatus.RUNNING, 0, "开始 Ultralytics 推理", task=task)
+        publish_status(client, args, TaskStatus.RUNNING, 0, "开始 Ultralytics 推理")
+        flat = {key: value for sub in test_values.values() if isinstance(sub, dict) for key, value in sub.items()}
+        kwargs = {key: flat[key] for key in ("imgsz", "conf", "iou", "max_det", "device") if key in flat}
         results = model.predict(
             source=[path for _, path in records],
             task=task,
-            imgsz=integer(inference, "image_size", 640),
-            conf=floating(inference, "confidence_threshold", 0.25),
-            iou=floating(inference, "nms_threshold", 0.45),
             save=False,
             verbose=False,
+            **kwargs,
         )
         by_image: dict[int, list[dict[str, Any]]] = {image_id: [] for image_id, _ in records}
         for (image_id, _), result in zip(records, results):
@@ -179,3 +183,4 @@ def main() -> int:
     finally:
         if client is not None:
             client.close()
+

@@ -41,7 +41,14 @@ def main() -> int:
         datamodule = build_datamodule(config, "train_params")
         model = build_model(config, "train_params", visualizer=False)
         engine = build_engine(config, "train_params", progress.callback)
-        engine.fit(model=model, datamodule=datamodule)
+
+        checkpoint = text(group(config, "train_params", "network"), "checkpoint")
+        if checkpoint and not Path(checkpoint).is_absolute():
+            checkpoint = str(Path(args.model_root) / checkpoint)
+        if checkpoint and Path(checkpoint).is_file():
+            engine.fit(model=model, datamodule=datamodule, ckpt_path=checkpoint)
+        else:
+            engine.fit(model=model, datamodule=datamodule)
         results = engine.test(model=model, datamodule=datamodule)
 
         # A configured checkpoint interval may not hit the final epoch, so
@@ -69,3 +76,4 @@ def main() -> int:
     finally:
         if client is not None:
             client.close()
+

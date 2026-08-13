@@ -17,6 +17,7 @@ from dltool_common import (
     create_task_client,
     evaluate_validation,
     floating,
+    format_hms,
     group,
     integer,
     load_database_config,
@@ -25,11 +26,6 @@ from dltool_common import (
     select_device,
     text,
 )
-
-
-def _sec2hms(s):
-    s = int(s)
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
 def main() -> int:
@@ -92,6 +88,13 @@ def main() -> int:
         )
 
         model, trainable = build_mask_constraint_model(network, training, device)
+        checkpoint = text(network, "checkpoint")
+        if checkpoint and not Path(checkpoint).is_absolute():
+            checkpoint = str(Path(args.model_root) / checkpoint)
+        if checkpoint and Path(checkpoint).is_file():
+            state_dict = torch.load(checkpoint, map_location=device)
+            model.load_state_dict(state_dict)
+            reporter.log(f"加载初始权重: {checkpoint}")
         bottleneck = model.bottleneck
         decoder = model.decoder
 
@@ -199,8 +202,8 @@ def main() -> int:
                     message = (
                         f"iter [{iteration}/{max_iters}], loss={mean_total:.4f}, "
                         f"dinomaly={mean_loss:.4f}, good={mean_good:.4f}, "
-                        f"anomaly={mean_anomaly:.4f}, elapsed={_sec2hms(elapsed)}, "
-                        f"ETA={_sec2hms(eta)}"
+                        f"anomaly={mean_anomaly:.4f}, elapsed={format_hms(elapsed)}, "
+                        f"ETA={format_hms(eta)}"
                     )
                     reporter.report(
                         iteration,
@@ -213,8 +216,8 @@ def main() -> int:
                         iter=f"{iteration} / {max_iters}",
                         lr=f"{optimizer.param_groups[0]['lr']:.6f}",
                         loss=f"{mean_total:.4f}",
-                        elapsed=_sec2hms(elapsed),
-                        eta=_sec2hms(eta),
+                        elapsed=format_hms(elapsed),
+                        eta=format_hms(eta),
                     )
                     if writer is not None:
                         writer.add_scalar("train/loss", mean_loss, iteration)
@@ -262,3 +265,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

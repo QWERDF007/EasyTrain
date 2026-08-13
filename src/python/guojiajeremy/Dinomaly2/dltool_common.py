@@ -32,6 +32,19 @@ from dltool_task_reporting import (  # noqa: E402
     report_result,
     report_status as status,
 )
+from dltool_task_utils import (  # noqa: E402
+    boolean,
+    floating,
+    format_hms,
+    integer,
+    is_character_sequence,
+    load_params_table,
+    parse_int_list,
+    scalar,
+    select_device,
+    should_stop,
+    text,
+)
 
 
 def add_task_arguments(parser: argparse.ArgumentParser) -> None:
@@ -57,38 +70,10 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dltool_task_id", type=int, default=-1)
 
 
-def _insert_value(target: dict[str, Any], name: str, value: Any) -> None:
-    parts = [part for part in str(name).split(".") if part]
-    current = target
-    for part in parts[:-1]:
-        child = current.get(part)
-        if not isinstance(child, dict):
-            child = {}
-            current[part] = child
-        current = child
-    if parts:
-        current[parts[-1]] = value
-
-
-def _load_params(database_path: str | Path, table: str) -> dict[str, Any]:
-    path = Path(database_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"database not found: {path}")
-    if table not in {"train_params", "test_params"}:
-        raise ValueError(f"unsupported parameter table: {table}")
-
-    result: dict[str, Any] = {}
-    with sqlite3.connect(path) as connection:
-        rows = connection.execute(f"SELECT name_en, value FROM {table} ORDER BY name_en").fetchall()
-    for name, encoded in rows:
-        _insert_value(result, str(name), json.loads(encoded))
-    return result
-
-
 def load_database_config(args: argparse.Namespace, section: str) -> dict[str, Any]:
     """Build the runner view from model.db/task.db and the model file lists."""
-    train_params = _load_params(args.model_db, "train_params")
-    test_params = _load_params(args.task_db, "test_params") if args.task_db else {}
+    train_params = load_params_table(args.model_db, "train_params")
+    test_params = load_params_table(args.task_db, "test_params") if args.task_db else {}
     config: dict[str, Any] = {
         "model_uuid": args.model_uuid,
         "model_architecture": args.model_architecture,
@@ -124,11 +109,12 @@ def load_database_config(args: argparse.Namespace, section: str) -> dict[str, An
         inference = dict(group(config, "test_params", "inference"))
         if args.prediction_dir:
             inference["output_dir"] = args.prediction_dir
-        checkpoint = text(inference, "checkpoint_path")
+        checkpoint = text(inference, "checkpoint")
         if checkpoint and not Path(checkpoint).is_absolute():
             candidates = [Path(args.model_root) / checkpoint, Path(args.weight_dir) / checkpoint]
             checkpoint = str(next((candidate for candidate in candidates if candidate.is_file()), candidates[-1]))
-            inference["checkpoint_path"] = checkpoint
+        if checkpoint:
+            inference["checkpoint"] = checkpoint
         config["test_params"]["inference"] = inference
     return config
 
@@ -139,71 +125,6 @@ def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
         return {}
     value = section_values.get(name, {})
     return value if isinstance(value, dict) else {}
-
-
-def is_character_sequence(value: Any) -> bool:
-    return isinstance(value, list) and bool(value) and all(len(str(item)) == 1 for item in value)
-
-
-def scalar(value: Any, default: str = "") -> Any:
-    if value is None:
-        return default
-    if is_character_sequence(value):
-        return "".join(str(item) for item in value)
-    return value
-
-
-def text(values: dict[str, Any], name: str, default: str = "") -> str:
-    value = scalar(values.get(name, default), default)
-    return default if value is None else str(value).strip()
-
-
-def integer(values: dict[str, Any], name: str, default: int = 0) -> int:
-    try:
-        return int(scalar(values.get(name, default), str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def floating(values: dict[str, Any], name: str, default: float = 0.0) -> float:
-    try:
-        return float(scalar(values.get(name, default), str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def boolean(values: dict[str, Any], name: str, default: bool = False) -> bool:
-    value = scalar(values.get(name, default), str(default))
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def should_stop(client: TaskClient | None, task_id: int) -> bool:
-    return client is not None and client.should_stop(task_id)
-
-
-def parse_int_list(value: Any, default: list[int] | None = None) -> list[int]:
-    """Parse a comma/space separated integer list (e.g. ``"1,3,244"``)."""
-    result: list[int] = []
-    if value is None:
-        return list(default or [])
-    if isinstance(value, list):
-        for item in value:
-            try:
-                result.append(int(item))
-            except (TypeError, ValueError):
-                continue
-    else:
-        for part in str(value).replace(";", ",").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                result.append(int(part))
-            except ValueError:
-                continue
-    return result or list(default or [])
 
 
 def mask_value_lists(
@@ -290,25 +211,6 @@ def file_list_samples(
     if required and not result:
         raise ValueError(f"dataset file list has no usable samples: {file_list_path}")
     return result
-
-
-def select_device(values: dict[str, Any], name: str = "device", default: str = "cuda:0") -> str:
-    """Resolve the device parameter to a torch device string."""
-    import torch
-
-    selected = text(values, name, default).strip().lower()
-    if torch.cuda.is_available():
-        if selected.startswith(("cuda:", "gpu:")):
-            try:
-                index = int(selected.split(":", 1)[1])
-                if 0 <= index < torch.cuda.device_count():
-                    return f"cuda:{index}"
-            except (TypeError, ValueError):
-                pass
-            return "cuda:0"
-        if selected in {"cuda", "gpu"}:
-            return "cuda:0"
-    return "cpu"
 
 
 def build_mask_constraint_model(
@@ -628,3 +530,4 @@ class DltoolProgressReporter:
             message,
             **payload,
         )
+
