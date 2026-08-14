@@ -262,6 +262,7 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "val",
     }
 )
 CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, sizes or seeds
@@ -269,6 +270,7 @@ CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, 
     "max_det": 1,
     "mask_ratio": 1,
     "vid_stride": 1,
+    "val": 1,
     "seed": 0,
 }
 CFG_BOOL_KEYS = frozenset(
@@ -281,7 +283,6 @@ CFG_BOOL_KEYS = frozenset(
         "rect",
         "cos_lr",
         "overlap_mask",
-        "val",
         "save_json",
         "dnn",
         "plots",

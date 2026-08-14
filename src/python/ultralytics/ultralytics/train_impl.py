@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import time
 from pathlib import Path
 
@@ -48,6 +47,7 @@ TRAIN_KWARG_WHITELIST = {
     "seed",
     "amp",
     "device",
+    "val",
     "mosaic",
     "mixup",
     "copy_paste",
@@ -200,28 +200,16 @@ def _resolve_checkpoint(args: argparse.Namespace, values: dict) -> str:
     return checkpoint
 
 
-def _collect_finished_weights(log_dir: Path, weight_dir: str) -> str:
-    """将训练产出的 best.pt/last.pt 从日志目录移动到权重目录（保留文件名）。"""
-    source_dir = Path(log_dir) / "weights"
+def _collect_finished_weights(weight_dir: str) -> str:
+    """返回训练直接落盘的权重：优先 best.pt，其次 last.pt。"""
     output_dir = Path(weight_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    collected = []
-    for name in ("best.pt", "last.pt"):
-        source = source_dir / name
-        if not source.is_file():
-            continue
-        target = output_dir / name
-        if source.resolve() != target.resolve():
-            shutil.move(str(source), str(target))
-        collected.append(str(target))
-    # 权重已移走，清理日志目录下遗留的 weights 目录。
-    try:
-        source_dir.rmdir()
-    except OSError:
-        pass
-    if not collected:
-        raise FileNotFoundError("Ultralytics training did not produce a checkpoint")
-    return collected[0]
+    best = output_dir / "best.pt"
+    last = output_dir / "last.pt"
+    if best.is_file():
+        return str(best)
+    if last.is_file():
+        return str(last)
+    raise FileNotFoundError("Ultralytics training did not produce a checkpoint")
 
 
 def main() -> int:
@@ -263,12 +251,14 @@ def main() -> int:
             data=str(data_yaml),
             task=task,
             **kwargs,
+            # 权重直接落 <模型>/train/weights；results.csv、TensorBoard 等日志仍在 <模型>/train/logs。
+            weights_dir=str(args.weight_dir),
             project=str(log_dir.parent),
             name=log_dir.name,
             exist_ok=True,
             verbose=False,
         )
-        checkpoint = _collect_finished_weights(log_dir, args.weight_dir)
+        checkpoint = _collect_finished_weights(args.weight_dir)
 
         metrics = _metrics_text(results)
         report_result(client, args, "训练结果", {"checkpoint": checkpoint, "results": metrics})

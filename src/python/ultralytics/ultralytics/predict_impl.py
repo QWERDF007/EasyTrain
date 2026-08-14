@@ -18,6 +18,7 @@ from dltool_common import (
     model_task,
     publish_status,
     report_failure,
+    report_log,
     report_result,
     test_params,
     text,
@@ -163,13 +164,38 @@ def main() -> int:
         publish_status(client, args, TaskStatus.RUNNING, 0, "开始 Ultralytics 推理")
         flat = {key: value for sub in test_values.values() if isinstance(sub, dict) for key, value in sub.items()}
         kwargs = {key: flat[key] for key in ("imgsz", "conf", "iou", "max_det", "device") if key in flat}
-        results = model.predict(
-            source=[path for _, path in records],
-            task=task,
-            save=False,
-            verbose=False,
-            **kwargs,
+        batch_size = max(1, int(flat.get("batch_size") or 1))
+        kwargs["batch"] = batch_size
+        report_log(
+            client,
+            args,
+            "推理参数: "
+            + json.dumps(
+                {
+                    "inference": inference,
+                    "batch_size": flat.get("batch_size"),
+                    "image_count": len(records),
+                    "kwargs": kwargs,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
         )
+        # 路径列表会被本分支的 LoadPilAndNumpy 当作一批内存图像处理，Loader 的
+        # batch 等于列表长度并忽略 batch 参数；因此必须在这里手动按 batch_size
+        # 分块调用，否则 328 张图会被一次性送入 GPU。
+        results: list = []
+        for start in range(0, len(records), batch_size):
+            batch_records = records[start : start + batch_size]
+            results.extend(
+                model.predict(
+                    source=[path for _, path in batch_records],
+                    task=task,
+                    save=False,
+                    verbose=False,
+                    **kwargs,
+                )
+            )
         by_image: dict[int, list[dict[str, Any]]] = {image_id: [] for image_id, _ in records}
         for (image_id, _), result in zip(records, results):
             by_image[image_id] = prediction_records(result, image_id, task, class_ids)

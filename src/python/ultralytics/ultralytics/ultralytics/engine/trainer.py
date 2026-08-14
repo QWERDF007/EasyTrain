@@ -141,7 +141,8 @@ class BaseTrainer:
         # Dirs
         self.save_dir = get_save_dir(self.args)
         self.args.name = self.save_dir.name  # update name for loggers
-        self.wdir = self.save_dir / "weights"  # weights dir
+        weights_dir_arg = getattr(self.args, "weights_dir", "") or ""
+        self.wdir = Path(weights_dir_arg) if weights_dir_arg else self.save_dir / "weights"  # weights dir
         if RANK in {-1, 0}:
             self.wdir.mkdir(parents=True, exist_ok=True)  # make dir
             self.args.save_dir = str(self.save_dir)
@@ -591,7 +592,14 @@ class BaseTrainer:
 
             # Validation
             final_epoch = epoch + 1 >= self.epochs
-            if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+            val = self.args.val
+            if isinstance(val, bool):
+                validate_now = val
+            elif isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+                validate_now = (epoch + 1) % int(val) == 0
+            else:
+                validate_now = False
+            if validate_now or final_epoch or self.stopper.possible_stop or self.stop:
                 self._clear_memory(None if self.device.type == "mps" else 0.5)  # prevent VRAM spike
                 self.metrics, self.fitness = self.validate()
 
