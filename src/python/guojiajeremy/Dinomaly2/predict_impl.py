@@ -130,7 +130,7 @@ def main() -> int:
 
                     flat = np.sort(np.asarray(score_map, dtype=np.float64).ravel())[::-1]
                     top_count = max(1, int(flat.size * 0.01))
-                    image_score = float(np.clip(flat[:top_count].mean(), 0.0, 1.0))
+                    image_score = float(flat[:top_count].mean())
                     records.append((int(image_id), {"image_score": image_score}))
                 done += anomaly_map.shape[0]
                 reporter.report(

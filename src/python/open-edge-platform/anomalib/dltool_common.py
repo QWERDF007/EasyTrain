@@ -122,32 +122,32 @@ def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
 
 
 def build_datamodule(config: dict[str, Any], section: str):
-    data_group = "training" if section == "train_params" else "data"
-    data = group(config, section, data_group)
-    batch_size = integer(data, "batch_size", 32)
+    runtime_group = "training" if section == "train_params" else "inference"
+    runtime_params = group(config, section, runtime_group)
+    batch_size = integer(runtime_params, "batch_size", 32)
     eval_batch_size = batch_size
     if section == "train_params":
         train_samples = dltool_file_list_samples(config, "train", split="train", normal_only=True)
         validation_samples = dltool_file_list_samples(config, "validation", split="test", required=False)
         return DltoolCustomDataModule(
-            name=text(data, "name", "dltool"),
+            name=text(runtime_params, "name", "dltool"),
             train_samples=train_samples,
             validation_samples=validation_samples,
             test_samples=validation_samples,
             train_batch_size=batch_size,
             eval_batch_size=eval_batch_size,
-            num_workers=integer(data, "num_workers", 8),
+            num_workers=integer(runtime_params, "num_workers", 8),
         )
 
     test_samples = dltool_file_list_samples(config, "test", split="test")
     return DltoolCustomDataModule(
-        name=text(data, "name", "dltool"),
+        name=text(runtime_params, "name", "dltool"),
         train_samples=[],
         validation_samples=[],
         test_samples=test_samples,
         train_batch_size=batch_size,
         eval_batch_size=eval_batch_size,
-        num_workers=integer(data, "num_workers", 8),
+        num_workers=integer(runtime_params, "num_workers", 8),
     )
 
 
