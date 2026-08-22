@@ -162,7 +162,9 @@ def main() -> int:
         task = model_task(args.model_architecture)
         model = YOLO(checkpoint, task=task, verbose=False)
         publish_status(client, args, TaskStatus.RUNNING, 0, "开始 Ultralytics 推理")
-        flat = {key: value for sub in test_values.values() if isinstance(sub, dict) for key, value in sub.items()}
+        # Evaluation parameters are consumed by the C++ evaluator only.
+        # Never flatten the whole task config into Python inference options.
+        flat = dict(inference)
         kwargs = {key: flat[key] for key in ("imgsz", "conf", "iou", "max_det", "device") if key in flat}
         batch_size = max(1, int(flat.get("batch_size") or 1))
         kwargs["batch"] = batch_size

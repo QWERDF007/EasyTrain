@@ -73,7 +73,11 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
 def load_database_config(args: argparse.Namespace, section: str) -> dict[str, Any]:
     """Build the runner view from model.db/task.db and the model file lists."""
     train_params = load_params_table(args.model_db, "train_params")
-    test_params = load_params_table(args.task_db, "test_params") if args.task_db else {}
+    raw_test_params = load_params_table(args.task_db, "test_params") if args.task_db else {}
+    # Evaluation parameters are consumed by the C++ evaluator after prediction.
+    # Keep them out of the Python runner configuration so inference cannot
+    # accidentally depend on evaluation-only values.
+    test_params = {"inference": dict(group({"test_params": raw_test_params}, "test_params", "inference"))}
     config: dict[str, Any] = {
         "model_uuid": args.model_uuid,
         "model_architecture": args.model_architecture,
