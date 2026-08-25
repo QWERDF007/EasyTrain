@@ -12,6 +12,7 @@ from dltool_common import (
     build_engine,
     build_model,
     create_task_client,
+    disable_post_processing,
     group,
     load_database_config,
     report_failure,
@@ -163,7 +164,11 @@ def main() -> int:
         status(client, args.dltool_task_id, TaskStatus.RUNNING, 0, -1, "开始 anomalib 预测")
 
         datamodule = build_datamodule(config, "test_params")
-        model = build_model(config, "test_params", visualizer=False)
+        # Keep anomalib's post-processor module so the model structure matches
+        # training checkpoints, but disable its transformations. The C++
+        # evaluation layer consumes the original score domain from the model.
+        model = build_model(config, "test_params", visualizer=False, post_processor=True)
+        disable_post_processing(model)
         engine = build_engine(config, "test_params", progress.callback)
         predictions = engine.predict(
             model=model,

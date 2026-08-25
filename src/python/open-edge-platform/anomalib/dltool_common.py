@@ -401,6 +401,7 @@ def build_model(
     config: dict[str, Any],
     section: str = "train_params",
     visualizer: bool = True,
+    post_processor: bool = True,
 ):
     architecture = str(config.get("model_architecture", "")).strip().lower()
     model_params = group(config, "train_params", "network")
@@ -432,6 +433,7 @@ def build_model(
             ),
             precision=text(training_params, "precision", text(model_params, "precision", "float32")),
             pre_processor=pre_processor,
+            post_processor=post_processor,
             evaluator=DltoolEvaluator(
                 val_metrics=default_validation_metrics(),
                 test_metrics=list(Patchcore.configure_evaluator().test_metrics),
@@ -475,11 +477,28 @@ def build_model(
             precision=text(training_params, "precision", text(model_params, "precision", "float32")),
             learning_rate=floating(training_params, "learning_rate", 2e-3),
             pre_processor=pre_processor,
+            post_processor=post_processor,
             evaluator=evaluator,
             visualizer=visualizer,
         )
 
     raise ValueError(f"Unsupported anomalib architecture: {architecture}")
+
+
+def disable_post_processing(model: Any) -> None:
+    """Keep checkpoint structure while exposing raw model scores.
+
+    Training checkpoints contain the state of anomalib's post-processor.  The
+    inference model must therefore keep that module so Lightning can restore
+    the checkpoint, but the application-level evaluator consumes the original
+    anomaly scores and applies its own thresholding in C++.
+    """
+    post_processor = getattr(model, "post_processor", None)
+    if post_processor is None:
+        return
+    post_processor.enable_normalization = False
+    post_processor.enable_thresholding = False
+    post_processor.enable_threshold_matching = False
 
 
 def build_engine(config: dict[str, Any], section: str, callback):
