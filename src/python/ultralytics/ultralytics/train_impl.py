@@ -27,7 +27,8 @@ from dltool_common import (
     train_params,
 )
 
-# 允许透传给 YOLO.train() 的参数名（name_en 与 ultralytics 参数名一致）。
+# 允许从模型配置传入的训练参数名；val_interval 在提交给 Ultralytics
+# 前映射为其实际的 val 参数。
 TRAIN_KWARG_WHITELIST = {
     "epochs",
     "batch",
@@ -47,7 +48,7 @@ TRAIN_KWARG_WHITELIST = {
     "seed",
     "amp",
     "device",
-    "val",
+    "val_interval",
     "mosaic",
     "mixup",
     "copy_paste",
@@ -245,7 +246,11 @@ def main() -> int:
         reporter.install(model)
 
         flat = _flatten_params(values)
-        kwargs = {key: flat[key] for key in TRAIN_KWARG_WHITELIST if key in flat}
+        kwargs = {
+            ("val" if key == "val_interval" else key): flat[key]
+            for key in TRAIN_KWARG_WHITELIST
+            if key in flat
+        }
         log_dir = Path(args.log_dir or str(Path(args.weight_dir).parent / "logs"))
         results = model.train(
             data=str(data_yaml),

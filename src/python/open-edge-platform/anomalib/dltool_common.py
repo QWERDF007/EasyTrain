@@ -472,7 +472,7 @@ def build_model(
             use_context_recentering=boolean(
                 training_params,
                 "use_context_recentering",
-                boolean(model_params, "use_context_recentering", True),
+                boolean(model_params, "use_context_recentering", False),
             ),
             precision=text(training_params, "precision", text(model_params, "precision", "float32")),
             learning_rate=floating(training_params, "learning_rate", 2e-3),
@@ -548,7 +548,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
         checkpoint_kwargs: dict[str, Any] = {}
         if "checkpoint_every_n_epoch" in runtime_params:
             checkpoint_kwargs["every_n_epochs"] = max(
-                1, integer(runtime_params, "checkpoint_every_n_epoch", 5)
+                1, integer(runtime_params, "checkpoint_every_n_epoch", 1)
             )
         callbacks.insert(
             0,
@@ -578,7 +578,7 @@ def build_engine(config: dict[str, Any], section: str, callback):
         kwargs["max_steps"] = max_steps
     if "check_val_every_n_epoch" in runtime_params:
         kwargs["check_val_every_n_epoch"] = max(
-            1, integer(runtime_params, "check_val_every_n_epoch", 5)
+            1, integer(runtime_params, "check_val_every_n_epoch", 1)
         )
     return Engine(**kwargs)
 
