@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 
 class ProtocolField(Enum):
+    PROJECT_ID = "project_id"
     TASK_ID = "task_id"
     RUN_ID = "run_id"
     TYPE = "type"
@@ -52,11 +53,12 @@ def protocol_value(value: Any) -> Any:
 
 
 class AsyncTaskClient:
-    def __init__(self, host: str, port: int, task_id: int, run_id: str):
+    def __init__(self, host: str, port: int, task_id: int, run_id: str, project_id: str):
         self._task_id = int(task_id)
         self._run_id = str(run_id).strip()
-        if self._task_id < 0 or not self._run_id:
-            raise ValueError("task_id and run_id are required for task communication")
+        self._project_id = str(project_id).strip()
+        if self._task_id < 0 or not self._run_id or not self._project_id:
+            raise ValueError("task_id, run_id and project_id are required for task communication")
         self._host = host
         self._port = int(port)
         self._reader: Optional[asyncio.StreamReader] = None
@@ -95,6 +97,7 @@ class AsyncTaskClient:
             raise ValueError("task message identity does not match the connected task")
 
         data: dict[str, Any] = dict(payload)
+        data[ProtocolField.PROJECT_ID.value] = self._project_id
         data[ProtocolField.TASK_ID.value] = self._task_id
         data[ProtocolField.RUN_ID.value] = self._run_id
         data[ProtocolField.TYPE.value] = protocol_value(msg_type)
@@ -138,7 +141,10 @@ class AsyncTaskClient:
             except (TypeError, ValueError):
                 command_task_id = -1
 
+            command_project_id = str(command.get(ProtocolField.PROJECT_ID.value, "")).strip()
             command_run_id = str(command.get(ProtocolField.RUN_ID.value, "")).strip()
+            if command_project_id != self._project_id:
+                continue
             if command_task_id not in expected or command_run_id != self._run_id:
                 kept.append(command)
                 continue
@@ -174,8 +180,10 @@ class AsyncTaskClient:
                     command_task_id = int(data.get(ProtocolField.TASK_ID.value, -1))
                 except (TypeError, ValueError):
                     continue
+                command_project_id = str(data.get(ProtocolField.PROJECT_ID.value, "")).strip()
                 command_run_id = str(data.get(ProtocolField.RUN_ID.value, "")).strip()
-                if command_task_id != self._task_id or command_run_id != self._run_id:
+                if (command_project_id != self._project_id or command_task_id != self._task_id
+                        or command_run_id != self._run_id):
                     continue
                 self._commands.put_nowait(data)
         except asyncio.CancelledError:
@@ -187,18 +195,19 @@ class AsyncTaskClient:
 
 
 class TaskClient:
-    def __init__(self, host: str, port: int, task_id: int, run_id: str):
+    def __init__(self, host: str, port: int, task_id: int, run_id: str, project_id: str):
         self._task_id = int(task_id)
         self._run_id = str(run_id).strip()
-        if self._task_id < 0 or not self._run_id:
-            raise ValueError("task_id and run_id are required for task communication")
+        self._project_id = str(project_id).strip()
+        if self._task_id < 0 or not self._run_id or not self._project_id:
+            raise ValueError("task_id, run_id and project_id are required for task communication")
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._closed = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._ready.wait(timeout=10)
-        self._client = AsyncTaskClient(host, int(port), self._task_id, self._run_id)
+        self._client = AsyncTaskClient(host, int(port), self._task_id, self._run_id, self._project_id)
         self._submit(self._client.connect()).result(timeout=10)
 
     def close(self) -> None:

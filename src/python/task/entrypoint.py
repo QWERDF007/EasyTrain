@@ -25,12 +25,14 @@ def _task_args() -> Namespace:
         "dltool_task_port": 0,
         "dltool_task_id": -1,
         "dltool_run_id": "",
+        "dltool_project_id": "",
     }
     option_names = {
         "--dltool_task_host": "dltool_task_host",
         "--dltool_task_port": "dltool_task_port",
         "--dltool_task_id": "dltool_task_id",
         "--dltool_run_id": "dltool_run_id",
+        "--dltool_project_id": "dltool_project_id",
     }
     integer_names = {"dltool_task_port", "dltool_task_id"}
     for index, argument in enumerate(sys.argv):

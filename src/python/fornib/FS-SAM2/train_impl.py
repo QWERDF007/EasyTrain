@@ -278,6 +278,7 @@ def main():
     parser.add_argument('--dltool_task_host', type=str, default='')
     parser.add_argument('--dltool_task_port', type=int, default=0)
     parser.add_argument('--dltool_task_id', type=int, default=-1)
+    parser.add_argument('--dltool_project_id', type=str, default='')
     parser.add_argument('--dltool_run_id', type=str, default='')
     args = parser.parse_args()
     apply_database_config(args)
