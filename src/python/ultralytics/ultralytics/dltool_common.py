@@ -55,6 +55,7 @@ def add_task_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dltool_task_host", default="")
     parser.add_argument("--dltool_task_port", type=int, default=0)
     parser.add_argument("--dltool_task_id", type=int, default=-1)
+    parser.add_argument("--dltool_run_id", default="")
 
 
 def group(values: dict[str, Any], name: str) -> dict[str, Any]:

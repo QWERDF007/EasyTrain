@@ -23,9 +23,15 @@ def task_id(value: Namespace | int) -> int:
 
 
 def create_task_client(args: Namespace) -> TaskClient | None:
-    if not args.dltool_task_host or args.dltool_task_port <= 0 or args.dltool_task_id < 0:
+    host = str(getattr(args, "dltool_task_host", "")).strip()
+    port = int(getattr(args, "dltool_task_port", 0))
+    task = int(getattr(args, "dltool_task_id", -1))
+    run = str(getattr(args, "dltool_run_id", "")).strip()
+    if not host or port <= 0:
         return None
-    return TaskClient(args.dltool_task_host, args.dltool_task_port)
+    if task < 0 or not run:
+        raise ValueError("dltool_task_id and dltool_run_id are required when task communication is enabled")
+    return TaskClient(host, port, task, run)
 
 
 def report_status(client: TaskClient | None, task: Namespace | int, status: TaskStatus,

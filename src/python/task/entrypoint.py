@@ -24,18 +24,21 @@ def _task_args() -> Namespace:
         "dltool_task_host": "",
         "dltool_task_port": 0,
         "dltool_task_id": -1,
+        "dltool_run_id": "",
     }
     option_names = {
         "--dltool_task_host": "dltool_task_host",
         "--dltool_task_port": "dltool_task_port",
         "--dltool_task_id": "dltool_task_id",
+        "--dltool_run_id": "dltool_run_id",
     }
+    integer_names = {"dltool_task_port", "dltool_task_id"}
     for index, argument in enumerate(sys.argv):
         name = option_names.get(argument)
         if name is None or index + 1 >= len(sys.argv):
             continue
         value = sys.argv[index + 1]
-        values[name] = int(value) if name != "dltool_task_host" else value
+        values[name] = int(value) if name in integer_names else value
     return Namespace(**values)
 
 

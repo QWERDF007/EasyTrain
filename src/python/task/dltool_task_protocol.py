@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 class ProtocolField(Enum):
     TASK_ID = "task_id"
+    RUN_ID = "run_id"
     TYPE = "type"
     STATUS = "status"
     PROGRESS = "progress"
@@ -51,7 +52,11 @@ def protocol_value(value: Any) -> Any:
 
 
 class AsyncTaskClient:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, task_id: int, run_id: str):
+        self._task_id = int(task_id)
+        self._run_id = str(run_id).strip()
+        if self._task_id < 0 or not self._run_id:
+            raise ValueError("task_id and run_id are required for task communication")
         self._host = host
         self._port = int(port)
         self._reader: Optional[asyncio.StreamReader] = None
@@ -86,11 +91,13 @@ class AsyncTaskClient:
                    progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
         if self._closed or self._writer is None:
             return
+        if int(task_id) != self._task_id:
+            raise ValueError("task message identity does not match the connected task")
 
-        data: dict[str, Any] = {
-            ProtocolField.TASK_ID.value: int(task_id),
-            ProtocolField.TYPE.value: protocol_value(msg_type),
-        }
+        data: dict[str, Any] = dict(payload)
+        data[ProtocolField.TASK_ID.value] = self._task_id
+        data[ProtocolField.RUN_ID.value] = self._run_id
+        data[ProtocolField.TYPE.value] = protocol_value(msg_type)
         if status is not None:
             data[ProtocolField.STATUS.value] = protocol_value(status)
         if progress >= 0:
@@ -98,8 +105,6 @@ class AsyncTaskClient:
         data[ProtocolField.ETA_SECONDS.value] = max(-1, int(eta_seconds))
         if message:
             data[ProtocolField.MESSAGE.value] = message
-        data.update(payload)
-
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n"
         async with self._write_lock:
             if not self._closed and self._writer is not None:
@@ -118,7 +123,7 @@ class AsyncTaskClient:
         await self.send(task_id, MessageType.LOG, None, -1, -1, message)
 
     async def should_stop(self, *task_ids: int) -> bool:
-        expected = {int(task_id) for task_id in task_ids}
+        expected = {int(task_id) for task_id in task_ids} if task_ids else {self._task_id}
         kept: list[dict[str, Any]] = []
         should_stop = False
 
@@ -133,7 +138,8 @@ class AsyncTaskClient:
             except (TypeError, ValueError):
                 command_task_id = -1
 
-            if expected and command_task_id not in expected:
+            command_run_id = str(command.get(ProtocolField.RUN_ID.value, "")).strip()
+            if command_task_id not in expected or command_run_id != self._run_id:
                 kept.append(command)
                 continue
 
@@ -162,8 +168,16 @@ class AsyncTaskClient:
                     data = json.loads(line.decode("utf-8"))
                 except json.JSONDecodeError:
                     continue
-                if protocol_value(data.get(ProtocolField.TYPE.value)) == MessageType.COMMAND.value:
-                    self._commands.put_nowait(data)
+                if protocol_value(data.get(ProtocolField.TYPE.value)) != MessageType.COMMAND.value:
+                    continue
+                try:
+                    command_task_id = int(data.get(ProtocolField.TASK_ID.value, -1))
+                except (TypeError, ValueError):
+                    continue
+                command_run_id = str(data.get(ProtocolField.RUN_ID.value, "")).strip()
+                if command_task_id != self._task_id or command_run_id != self._run_id:
+                    continue
+                self._commands.put_nowait(data)
         except asyncio.CancelledError:
             raise
         except OSError:
@@ -173,14 +187,18 @@ class AsyncTaskClient:
 
 
 class TaskClient:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, task_id: int, run_id: str):
+        self._task_id = int(task_id)
+        self._run_id = str(run_id).strip()
+        if self._task_id < 0 or not self._run_id:
+            raise ValueError("task_id and run_id are required for task communication")
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._closed = False
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._ready.wait(timeout=10)
-        self._client = AsyncTaskClient(host, int(port))
+        self._client = AsyncTaskClient(host, int(port), self._task_id, self._run_id)
         self._submit(self._client.connect()).result(timeout=10)
 
     def close(self) -> None:
