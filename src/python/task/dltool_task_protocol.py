@@ -29,7 +29,6 @@ class MessageType(Enum):
 class TaskStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
-    PAUSED = "paused"
     STOPPED = "stopped"
     FINISHED = "finished"
     FAILED = "failed"
@@ -50,6 +49,82 @@ class TaskCommand(Enum):
 
 def protocol_value(value: Any) -> Any:
     return value.value if isinstance(value, Enum) else value
+
+
+VALID_MESSAGE_TYPES = {t.value for t in MessageType}
+VALID_TASK_STATUSES = {s.value for s in TaskStatus}
+
+
+def validate_task_message(data: Any) -> tuple[bool, str]:
+    """Strict validation of task protocol messages for both client and server."""
+    if not isinstance(data, dict):
+        return False, "消息必须为字典对象"
+
+    # project_id
+    if ProtocolField.PROJECT_ID.value not in data:
+        return False, "缺少 project_id 字段"
+    project_id = data[ProtocolField.PROJECT_ID.value]
+    if not isinstance(project_id, str) or not project_id.strip():
+        return False, "project_id 必须为非空字符串"
+
+    # task_id
+    if ProtocolField.TASK_ID.value not in data:
+        return False, "缺少 task_id 字段"
+    task_id = data[ProtocolField.TASK_ID.value]
+    if type(task_id) is not int or task_id < 0:
+        return False, "task_id 必须为非负整数"
+
+    # run_id
+    if ProtocolField.RUN_ID.value not in data:
+        return False, "缺少 run_id 字段"
+    run_id = data[ProtocolField.RUN_ID.value]
+    if not isinstance(run_id, str) or not run_id.strip():
+        return False, "run_id 必须为非空字符串"
+
+    # type
+    if ProtocolField.TYPE.value not in data:
+        return False, "缺少 type 字段"
+    msg_type = protocol_value(data[ProtocolField.TYPE.value])
+    if not isinstance(msg_type, str) or msg_type not in VALID_MESSAGE_TYPES:
+        return False, f"type 必须为有效消息类型: {msg_type}"
+
+    # status
+    if ProtocolField.STATUS.value in data:
+        status_val = protocol_value(data[ProtocolField.STATUS.value])
+        if not isinstance(status_val, str) or status_val not in VALID_TASK_STATUSES:
+            return False, f"status 必须为有效任务状态: {status_val}"
+    elif msg_type == MessageType.STATUS.value:
+        return False, "status 类型的消息必须包含 status 字段"
+
+    # progress
+    if ProtocolField.PROGRESS.value in data:
+        progress_val = data[ProtocolField.PROGRESS.value]
+        if type(progress_val) is not int or ((progress_val < 0 and progress_val != -1) or progress_val > 100):
+            return False, f"progress 必须为 0 到 100 的整数 (或 -1): {progress_val}"
+    elif msg_type == MessageType.PROGRESS.value:
+        return False, "progress 类型的消息必须包含 progress 字段"
+
+    # eta_seconds
+    if ProtocolField.ETA_SECONDS.value in data:
+        eta_val = data[ProtocolField.ETA_SECONDS.value]
+        if type(eta_val) is not int or eta_val < -1:
+            return False, f"eta_seconds 必须为 >= -1 的整数: {eta_val}"
+
+    # message
+    if ProtocolField.MESSAGE.value in data:
+        msg_val = data[ProtocolField.MESSAGE.value]
+        if not isinstance(msg_val, str):
+            return False, "message 必须为字符串"
+
+    # command
+    if ProtocolField.COMMAND.value in data:
+        cmd_val = protocol_value(data[ProtocolField.COMMAND.value])
+        if not isinstance(cmd_val, str) or TaskCommand.from_value(cmd_val) is None:
+            return False, f"command 必须为有效命令: {cmd_val}"
+    elif msg_type == MessageType.COMMAND.value:
+        return False, "command 类型的消息必须包含 command 字段"
+
+    return True, ""
 
 
 class AsyncTaskClient:
@@ -91,9 +166,7 @@ class AsyncTaskClient:
 
     async def send(self, task_id: int, msg_type: MessageType, status: Optional[TaskStatus],
                    progress: int, eta_seconds: int, message: str = "", **payload: Any) -> None:
-        if self._closed or self._writer is None:
-            return
-        if int(task_id) != self._task_id:
+        if type(task_id) is not int or int(task_id) != self._task_id:
             raise ValueError("task message identity does not match the connected task")
 
         data: dict[str, Any] = dict(payload)
@@ -103,11 +176,20 @@ class AsyncTaskClient:
         data[ProtocolField.TYPE.value] = protocol_value(msg_type)
         if status is not None:
             data[ProtocolField.STATUS.value] = protocol_value(status)
-        if progress >= 0:
-            data[ProtocolField.PROGRESS.value] = max(0, min(100, int(progress)))
-        data[ProtocolField.ETA_SECONDS.value] = max(-1, int(eta_seconds))
+        if progress is not None:
+            data[ProtocolField.PROGRESS.value] = progress
+        if eta_seconds is not None:
+            data[ProtocolField.ETA_SECONDS.value] = eta_seconds
         if message:
             data[ProtocolField.MESSAGE.value] = message
+
+        valid, err = validate_task_message(data)
+        if not valid:
+            raise ValueError(f"Invalid task message: {err}")
+
+        if self._closed or self._writer is None:
+            return
+
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n"
         async with self._write_lock:
             if not self._closed and self._writer is not None:
