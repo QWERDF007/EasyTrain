@@ -27,8 +27,7 @@ from dltool_common import (
     train_params,
 )
 
-# 允许从模型配置传入的训练参数名；val_interval 在提交给 Ultralytics
-# 前映射为其实际的 val 参数。
+# 允许从模型配置传入的训练参数名。
 TRAIN_KWARG_WHITELIST = {
     "epochs",
     "batch",
@@ -48,7 +47,7 @@ TRAIN_KWARG_WHITELIST = {
     "seed",
     "amp",
     "device",
-    "val_interval",
+    "val",
     "mosaic",
     "mixup",
     "copy_paste",
@@ -247,7 +246,7 @@ def main() -> int:
 
         flat = _flatten_params(values)
         kwargs = {
-            ("val" if key == "val_interval" else key): flat[key]
+            key: flat[key]
             for key in TRAIN_KWARG_WHITELIST
             if key in flat
         }
