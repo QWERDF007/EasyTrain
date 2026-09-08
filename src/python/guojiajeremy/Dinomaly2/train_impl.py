@@ -57,7 +57,7 @@ def main() -> int:
         crop_size = integer(network, "crop_size", 392)
         max_iters = integer(training, "max_iters", 40000)
         batch_size = integer(training, "batch_size", 8)
-        num_workers = integer(training, "num_workers", 4)
+        num_workers = integer(training, "num_workers", 2)
         device = text(training, "device", "cuda:0")
         device = select_device(training, "device", device)
         reporter.log(

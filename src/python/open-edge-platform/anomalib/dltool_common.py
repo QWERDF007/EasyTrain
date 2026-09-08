@@ -130,7 +130,7 @@ def group(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
 def build_datamodule(config: dict[str, Any], section: str):
     runtime_group = "training" if section == "train_params" else "inference"
     runtime_params = group(config, section, runtime_group)
-    batch_size = integer(runtime_params, "batch_size", 32)
+    batch_size = integer(runtime_params, "batch_size", 8)
     eval_batch_size = batch_size
     if section == "train_params":
         train_samples = dltool_file_list_samples(config, "train", split="train", normal_only=True)
@@ -142,7 +142,7 @@ def build_datamodule(config: dict[str, Any], section: str):
             test_samples=validation_samples,
             train_batch_size=batch_size,
             eval_batch_size=eval_batch_size,
-            num_workers=integer(runtime_params, "num_workers", 8),
+            num_workers=integer(runtime_params, "num_workers", 2),
         )
 
     test_samples = dltool_file_list_samples(config, "test", split="test")
@@ -153,7 +153,7 @@ def build_datamodule(config: dict[str, Any], section: str):
         test_samples=test_samples,
         train_batch_size=batch_size,
         eval_batch_size=eval_batch_size,
-        num_workers=integer(runtime_params, "num_workers", 8),
+        num_workers=integer(runtime_params, "num_workers", 2),
     )
 
 

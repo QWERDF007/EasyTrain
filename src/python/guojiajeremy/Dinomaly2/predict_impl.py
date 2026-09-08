@@ -69,7 +69,7 @@ def main() -> int:
         image_size = integer(network, "image_size", 448)
         crop_size = integer(network, "crop_size", 392)
         batch_size = integer(inference, "batch_size", 8)
-        num_workers = integer(inference, "num_workers", 4)
+        num_workers = integer(inference, "num_workers", 2)
         device = select_device(inference, "device", "cuda:0")
 
         reporter.start(
